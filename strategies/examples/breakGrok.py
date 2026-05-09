@@ -1,141 +1,293 @@
-# Asymmetric Long Options Strategy for OpenAlgo (Kotak Broker)
-# NSE F&O - Long Calls/Puts (30-60 DTE, slightly OTM)
-# All 5 checkpoints + liquidity + asymmetry score
+"""
+Checkpoint-only prototype for long options selection with the OpenAlgo SDK.
 
-import asyncio
+This file intentionally does NOT place orders.  It is meant to validate filters
+and select a candidate option row; execution should happen through the safer
+order-management path in options_momentum_strategy.py.
+"""
+
+import os
+from datetime import datetime
+
 import pandas as pd
-from datetime import datetime, timedelta
-from openalgo import Client
-from openalgo import build_option_chain_async
+from openalgo import api
 
 # ========================= CONFIG =========================
-API_KEY = "108acd4d1aa4fd7535a27ae62033bde891ba6a7a38f0147d90a18987650cdc11"   # From OpenAlgo dashboard
-BROKER = "kotak"
-UNDERLYINGS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY", "HINDALCO", "TCS", "TATAMOTORS","BHARTIARTL"]
+API_KEY = os.getenv("OPENALGO_API_KEY", "openalgo-apikey")
+API_HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
+SPOT_EXCHANGE = os.getenv("OPENALGO_STRATEGY_EXCHANGE", os.getenv("EXCHANGE", "NSE"))
+FNO_EXCHANGE = os.getenv("FNO_EXCHANGE", "NFO")
+INDEX_EXCHANGE = os.getenv("INDEX_EXCHANGE", "NSE_INDEX")
+UNDERLYINGS = [
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "HDFCBANK", "ICICIBANK",
+    "SBIN", "INFY", "HINDALCO", "TCS", "TATAMOTORS", "BHARTIARTL",
+]
+INDEX_UNDERLYINGS = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYNXT50",
+}
 RISK_PERCENT = 1.0
-PREMIUM_STOP_PCT = 45
+ACCOUNT_CAPITAL = float(os.getenv("ACCOUNT_CAPITAL", "1000000"))
+PREMIUM_STOP_PCT = 45.0
 DTE_MIN = 30
 DTE_MAX = 60
 DELTA_TARGET = (0.30, 0.45)
 ASYM_SCORE_THRESHOLD = 0.65
+IVR_BLOCK_THRESHOLD = 40.0
 
-client = Client(api_key=API_KEY, broker=BROKER)
+client = api(api_key=API_KEY, host=API_HOST)
 
-# ========================= HELPERS =========================
-async def get_option_chain(underlying: str, expiry: str):
-    df = await build_option_chain_async(underlying, expiry, depth=50)
-    return df
 
-def calculate_iv_rank(current_iv: float, iv_52w_low: float, iv_52w_high: float) -> float:
-    if iv_52w_high == iv_52w_low:
-        return 0.0
+def _underlying_exchange(symbol: str) -> str:
+    return INDEX_EXCHANGE if symbol in INDEX_UNDERLYINGS else SPOT_EXCHANGE
+
+
+def _extract_payload(response):
+    if not response:
+        return None
+    if isinstance(response, dict) and "data" in response:
+        return response.get("data")
+    return response
+
+
+def _extract_quote_field(response, key: str):
+    payload = _extract_payload(response)
+    if isinstance(payload, dict):
+        return payload.get(key)
+    if isinstance(response, dict):
+        return response.get(key)
+    return None
+
+
+def calculate_iv_rank(current_iv: float | None, iv_52w_low: float | None, iv_52w_high: float | None) -> float | None:
+    if current_iv is None or iv_52w_low is None or iv_52w_high is None:
+        return None
+    if iv_52w_high <= iv_52w_low:
+        return None
     return (current_iv - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100
 
-async def check_all_checkpoints(underlying: str):
-    """Returns (True, signal_dict) if ALL checkpoints pass"""
-    now = datetime.now()
 
-    # 1. Volatility Edge (IV Rank <40%)
-    quote = await client.quote(underlying)
-    atm_iv = quote.get("iv", 25.0)
-    iv_rank = calculate_iv_rank(atm_iv, 12.0, 35.0)  # ← replace with real 52w fetch later
-    if iv_rank >= 40:
+def _classify_ce_flow(chain_rows: list[dict]) -> tuple[int, str]:
+    ce_oi_chg = sum(r.get("ce_oi_chg", 0) or 0 for r in chain_rows)
+    ce_ltp_chg = sum(r.get("ce_ltp_chg", 0) or 0 for r in chain_rows)
+    if ce_oi_chg > 0 and ce_ltp_chg > 0.5:
+        return 2, "Call Buying"
+    if ce_oi_chg < 0 and ce_ltp_chg > 0.5:
+        return 1, "CE Short Covering"
+    if ce_oi_chg > 0 and ce_ltp_chg < -0.5:
+        return -2, "Call Writing"
+    if ce_oi_chg < 0 and ce_ltp_chg < -0.5:
+        return -1, "CE Long Unwinding"
+    return 0, "CE Neutral"
+
+
+def _classify_pe_flow(chain_rows: list[dict]) -> tuple[int, str]:
+    pe_oi_chg = sum(r.get("pe_oi_chg", 0) or 0 for r in chain_rows)
+    pe_ltp_chg = sum(r.get("pe_ltp_chg", 0) or 0 for r in chain_rows)
+    if pe_oi_chg > 0 and pe_ltp_chg < -0.5:
+        return 2, "Put Writing"
+    if pe_oi_chg > 0 and pe_ltp_chg > 0.5:
+        return -2, "Put Buying"
+    if pe_oi_chg < 0 and pe_ltp_chg > 0.5:
+        return 1, "PE Short Covering"
+    if pe_oi_chg < 0 and pe_ltp_chg < -0.5:
+        return -1, "PE Long Unwinding"
+    return 0, "PE Neutral"
+
+
+def _flatten_option_chain(chain_response) -> list[dict]:
+    payload = chain_response if isinstance(chain_response, dict) else {}
+    chain_rows = payload.get("chain", payload.get("data", []))
+    if not isinstance(chain_rows, list):
+        return []
+
+    flat_rows: list[dict] = []
+    for row in chain_rows:
+        strike = row.get("strike")
+        if strike is None:
+            continue
+        ce = row.get("ce") or {}
+        pe = row.get("pe") or {}
+        flat_rows.append(
+            {
+                "strike": strike,
+                "ce_symbol": ce.get("symbol"),
+                "ce_ltp": float(ce.get("ltp") or 0),
+                "ce_oi": float(ce.get("oi") or 0),
+                "ce_oi_chg": float(ce.get("oi_change") or 0),
+                "ce_ltp_chg": float(ce.get("change") or ce.get("ltp_change") or 0),
+                "ce_volume": float(ce.get("volume") or 0),
+                "ce_delta": abs(float(ce.get("delta") or 0)),
+                "ce_lotsize": int(ce.get("lotsize") or 0),
+                "pe_symbol": pe.get("symbol"),
+                "pe_ltp": float(pe.get("ltp") or 0),
+                "pe_oi": float(pe.get("oi") or 0),
+                "pe_oi_chg": float(pe.get("oi_change") or 0),
+                "pe_ltp_chg": float(pe.get("change") or pe.get("ltp_change") or 0),
+                "pe_volume": float(pe.get("volume") or 0),
+                "pe_delta": abs(float(pe.get("delta") or 0)),
+                "pe_lotsize": int(pe.get("lotsize") or 0),
+            }
+        )
+    return flat_rows
+
+
+def _select_candidate(flat_rows: list[dict], spot: float, direction: str) -> dict | None:
+    candidates: list[dict] = []
+    for row in flat_rows:
+        strike = float(row["strike"])
+        if direction == "bullish":
+            premium = row.get("ce_ltp") or 0
+            delta = row.get("ce_delta") or 0
+            volume = row.get("ce_volume") or 0
+            oi = row.get("ce_oi") or 0
+            lotsize = row.get("ce_lotsize") or 0
+            symbol = row.get("ce_symbol")
+            strike_ok = spot <= strike <= spot * 1.05
+            option_type = "CE"
+        else:
+            premium = row.get("pe_ltp") or 0
+            delta = row.get("pe_delta") or 0
+            volume = row.get("pe_volume") or 0
+            oi = row.get("pe_oi") or 0
+            lotsize = row.get("pe_lotsize") or 0
+            symbol = row.get("pe_symbol")
+            strike_ok = spot * 0.95 <= strike <= spot
+            option_type = "PE"
+
+        if not strike_ok or not symbol or premium <= 0 or lotsize <= 0:
+            continue
+        if oi <= 50000 or volume <= 10000:
+            continue
+        if not (DELTA_TARGET[0] <= delta <= DELTA_TARGET[1]):
+            continue
+
+        candidates.append(
+            {
+                "symbol": symbol,
+                "strike": strike,
+                "premium": premium,
+                "delta": delta,
+                "oi": oi,
+                "volume": volume,
+                "lotsize": lotsize,
+                "option_type": option_type,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda row: (-row["oi"], -row["volume"], abs(row["delta"] - 0.35)))
+    return candidates[0]
+
+
+def _size_quantity(best: dict) -> int:
+    risk_rupees = ACCOUNT_CAPITAL * RISK_PERCENT / 100
+    premium = float(best["premium"])
+    lotsize = int(best["lotsize"])
+    raw_qty = risk_rupees / premium
+    return max(lotsize, int(raw_qty // lotsize) * lotsize)
+
+
+def check_all_checkpoints(underlying: str):
+    """Return ``(passed, signal_dict)`` when the selection filters pass."""
+    quote = client.quotes(symbol=underlying, exchange=_underlying_exchange(underlying))
+    spot = float(_extract_quote_field(quote, "ltp") or 0)
+    if spot <= 0:
         return False, None
 
-    # Find 30-60 DTE expiry
-    expiries = await client.get_expiries(underlying)
+    atm_iv = _extract_quote_field(quote, "iv")
+    iv_rank = calculate_iv_rank(float(atm_iv) if atm_iv is not None else None, None, None)
+    if iv_rank is not None and iv_rank >= IVR_BLOCK_THRESHOLD:
+        return False, None
+
+    expiry_response = client.expiry(
+        symbol=underlying,
+        exchange=FNO_EXCHANGE,
+        instrumenttype="options",
+    )
+    expiry_list = _extract_payload(expiry_response) or []
+    if not isinstance(expiry_list, list):
+        return False, None
+
+    now = datetime.now().date()
     target_expiry = None
-    for exp in expiries:
-        dte = (datetime.strptime(exp, "%d%b%y") - now).days
+    for exp in expiry_list:
+        try:
+            dte = (datetime.strptime(str(exp), "%d%b%y").date() - now).days
+        except ValueError:
+            continue
         if DTE_MIN <= dte <= DTE_MAX:
-            target_expiry = exp
+            target_expiry = str(exp)
             break
     if not target_expiry:
         return False, None
 
-    chain = await get_option_chain(underlying, target_expiry)
+    chain_response = client.optionchain(
+        underlying=underlying,
+        exchange=_underlying_exchange(underlying),
+        expiry_date=target_expiry,
+        strike_count=50,
+    )
+    flat_rows = _flatten_option_chain(chain_response)
+    if not flat_rows:
+        return False, None
 
-    # 2. Technical Confluence (placeholder - expand with TA-Lib if needed)
-    # hist = await client.historical(underlying, interval="15m", days=5)
-    # Add MACD, ADX, volume checks here
-
-    # 3. Order-Flow & Sentiment Skew (fixed - no more undefined 'signal')
-    pcr = chain[chain['type'] == 'PE']['oi'].sum() / chain[chain['type'] == 'CE']['oi'].sum()
-    call_oi_build = (chain[(chain['type'] == 'CE') & (chain['oi_change'] > 0)]['oi_change'].sum() > 0)
-    put_oi_build  = (chain[(chain['type'] == 'PE') & (chain['oi_change'] > 0)]['oi_change'].sum() > 0)
-
-    # Simple bullish bias example (change to "bearish" for puts)
-    direction = "bullish"   # ← set dynamically from technicals later
-    if direction == "bullish":
-        skew_ok = (pcr < 0.8 and call_oi_build)
+    ce_score, ce_label = _classify_ce_flow(flat_rows)
+    pe_score, pe_label = _classify_pe_flow(flat_rows)
+    flow_score = ce_score + pe_score
+    if flow_score > 0:
+        direction = "bullish"
+    elif flow_score < 0:
+        direction = "bearish"
     else:
-        skew_ok = (pcr > 1.3 and put_oi_build)
-    if not skew_ok:
         return False, None
 
-    # 4. Catalyst (placeholder)
-    has_catalyst = True   # ← add Moneycontrol calendar fetch or hardcoded events
-
-    # 5. Pre-Volume Spurt Accumulation (placeholder)
-    obv_rising = True      # implement OBV on historical
-    delivery_rising = True # from NSE delivery data
-
-    # Liquidity Filter
-    liquid_strikes = chain[(chain['oi'] > 50000) & (chain['volume'] > 10000)]
-    if liquid_strikes.empty:
-        return False, None
-
-    # Asymmetry Score
-    asym_score = (1 - iv_rank/100) * 0.35 + 0.25 + 0.20 + 0.10 + 0.10
+    iv_component = 0.175 if iv_rank is None else (1 - iv_rank / 100) * 0.35
+    asym_score = iv_component + 0.25 + 0.20 + 0.10 + 0.10
     if asym_score < ASYM_SCORE_THRESHOLD:
         return False, None
 
-    # Select slightly OTM strike
-    atm_price = quote['ltp']
-    target_strikes = liquid_strikes[
-        (liquid_strikes['strike'].between(atm_price * 0.98, atm_price * 1.05)) &
-        (liquid_strikes['delta'].between(DELTA_TARGET[0], DELTA_TARGET[1]))
-    ]
-    if target_strikes.empty:
+    best = _select_candidate(flat_rows, spot, direction)
+    if not best:
         return False, None
 
-    best = target_strikes.iloc[0]
-    option_type = "CE" if direction == "bullish" else "PE"
-
-    capital = client.get_capital() or 1000000  # fallback
-    qty = int((capital * RISK_PERCENT / 100) / best['premium'])
-
+    qty = _size_quantity(best)
     return True, {
         "underlying": underlying,
-        "expiry": target_expiry,
-        "strike": best['strike'],
-        "option_type": option_type,
+        "spot": spot,
+        "expiry_date": target_expiry,
+        "direction": direction,
+        "option_type": best["option_type"],
+        "option_symbol": best["symbol"],
+        "strike": best["strike"],
+        "premium": best["premium"],
+        "lotsize": best["lotsize"],
         "quantity": qty,
-        "premium": best['premium']
+        "iv_rank": iv_rank,
+        "asym_score": round(asym_score, 3),
+        "ce_flow": ce_label,
+        "pe_flow": pe_label,
     }
 
-# ========================= MAIN =========================
-async def run_strategy():
-    print(f"[{datetime.now()}] Asymmetric Strategy Running (Kotak + OpenAlgo)")
-    for underlying in UNDERLYINGS:
-        passed, signal = await check_all_checkpoints(underlying)
-        if passed and signal:
-            print(f"ENTRY SIGNAL → {signal}")
-            order = await client.optionsorder(
-                underlying=signal["underlying"],
-                expiry=signal["expiry"],
-                strike=signal["strike"],
-                option_type=signal["option_type"],
-                action="BUY",
-                quantity=signal["quantity"],
-                price_type="MARKET"
-            )
-            if order.get("status") == "success":
-                print(f"✅ LONG {signal['option_type']} placed")
-            else:
-                print("❌ Order failed:", order)
 
-    await asyncio.sleep(900)  # 15-min loop
+def run_strategy():
+    print(f"[{datetime.now()}] Checkpoint prototype running (selection only)")
+    selected_rows = []
+    for underlying in UNDERLYINGS:
+        passed, signal = check_all_checkpoints(underlying)
+        if passed and signal:
+            selected_rows.append(signal)
+            print(f"SELECTED → {signal}")
+
+    if not selected_rows:
+        print("No candidates passed all checkpoints.")
+        return
+
+    print("\nSummary")
+    print(pd.DataFrame(selected_rows))
+    print("\nExecution is intentionally disabled in this prototype.")
+
 
 if __name__ == "__main__":
-    asyncio.run(run_strategy())
+    run_strategy()

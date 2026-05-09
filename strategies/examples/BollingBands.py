@@ -1,8 +1,14 @@
+import os
+
 from openalgo import api, ta
 
 # 1. Initialize Client
-# The host 127.0.0.1 works if the script runs on the same machine as OpenAlgo
-client = api(api_key='108acd4d1aa4fd7535a27ae62033bde891ba6a7a38f0147d90a18987650cdc11', host='http://127.0.0.1:5000')
+# API key is read from the OPENALGO_API_KEY environment variable.
+# When launched via OpenAlgo's /python runner it is injected automatically;
+# for standalone use: export OPENALGO_API_KEY=your-api-key
+API_KEY = os.getenv("OPENALGO_API_KEY", "openalgo-apikey")
+API_HOST = os.getenv("HOST_SERVER", "http://127.0.0.1:5000")
+client = api(api_key=API_KEY, host=API_HOST)
 
 # 2. Settings
 # These should match your "Current Symbol Mappings"

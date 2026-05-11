@@ -97,8 +97,11 @@ OTM_OFFSET    = int(os.getenv("OTM_OFFSET",    "1"))    # strikes OTM from ATM
 LOT_MULTIPLIER= int(os.getenv("LOT_MULTIPLIER","1"))    # lots to buy
 
 # Signal thresholds
-MIN_SCORE      = int(os.getenv("MIN_SCORE",    "50"))   # minimum |score| to trade
-MAX_TRAP       = int(os.getenv("MAX_TRAP",     "50"))   # maximum trap score to trade
+# ⚠ TESTING VALUES — restore to MIN_SCORE=50, MAX_TRAP=50 before production.
+# MIN_SCORE=5  : fires a trade on almost any non-zero score (stress-test execution path)
+# MAX_TRAP=100 : trap gate effectively disabled (all trap scores pass through)
+MIN_SCORE      = int(os.getenv("MIN_SCORE",    "5"))    # minimum |score| to trade
+MAX_TRAP       = int(os.getenv("MAX_TRAP",     "100"))  # maximum trap score to trade
 
 # Risk Management — Premium SL / Target
 PREMIUM_STOP_PCT   = float(os.getenv("PREMIUM_STOP_PCT",    "40.0"))   # % loss from entry premium
@@ -454,19 +457,28 @@ def compute_composite_score(
     components.append({"label": "EMA Trend", "score": s1, "max": 1, "direction": _dir(s1), "note": trend_note})
 
     # L1-b: RSI context
+    # Thresholds widened from 55/45 to 53/47 with 50-line partial scores
+    # to prevent the 45–55 dead zone from silencing this component on
+    # most intraday bars where RSI rarely reaches extreme levels.
     s2 = 0
     rsi_note = "RSI unavailable"
     if df_spot is not None and len(df_spot) >= RSI_PERIOD + 2:
         rsi = _rsi(df_spot["close"], RSI_PERIOD)
         rsi_val = rsi.iloc[-2]
-        if rsi_val > 55:
+        if rsi_val > 53:
             s2 = 1
             rsi_note = f"RSI {rsi_val:.1f} — bullish momentum"
-        elif rsi_val < 45:
+        elif rsi_val > 50:
+            s2 = 0.5
+            rsi_note = f"RSI {rsi_val:.1f} — mild bullish tilt"
+        elif rsi_val < 47:
             s2 = -1
             rsi_note = f"RSI {rsi_val:.1f} — bearish momentum"
+        elif rsi_val < 50:
+            s2 = -0.5
+            rsi_note = f"RSI {rsi_val:.1f} — mild bearish tilt"
         else:
-            rsi_note = f"RSI {rsi_val:.1f} — neutral"
+            rsi_note = f"RSI {rsi_val:.1f} — exactly neutral (50)"
     components.append({"label": "RSI Momentum", "score": s2, "max": 1, "direction": _dir(s2), "note": rsi_note})
 
     # L1-c: MACD Histogram
@@ -506,12 +518,25 @@ def compute_composite_score(
 
     # ── LAYER 2: OI Flow Intelligence ────────────────────────────────────────
     # L2-a: PCR OI Level
+    # DIRECTIONAL interpretation (options buyer framework from playbook):
+    #   High PCR = PUT OI dominant = bearish flow (prefer PE)
+    #     PCR > 1.3 → bearish tilt | PCR > 1.1 → mildly bearish
+    #   Low PCR  = CALL OI dominant = bullish flow (prefer CE)
+    #     PCR < 0.8 → bullish tilt | PCR < 1.0 → mildly bullish
+    #
+    # WARNING: Do NOT use the contrarian interpretation (high PCR = bullish reversal).
+    # That is a retail myth. For an options buyer, follow the OI flow direction:
+    #   more PE OI = bearish bias → score negative (favour PE entry)
+    #   more CE OI = bullish bias → score positive (favour CE entry)
+    #
+    # Playbook reference: PCR < 0.9 → bullish, PCR > 1.3 → bearish.
     pcr = _compute_pcr(chain_rows)
     s5 = 0
-    if pcr >= 1.2:    s5 = 1
-    elif pcr >= 1.0:  s5 = 0.5
-    elif pcr <= 0.6:  s5 = -1
-    elif pcr <= 0.8:  s5 = -0.5
+    if pcr <= 0.6:    s5 = 1     # CE strongly dominant  → bullish
+    elif pcr <= 0.9:  s5 = 0.5   # mild CE dominance     → mildly bullish
+    elif pcr <= 1.1:  s5 = 0     # near parity           → neutral
+    elif pcr <= 1.3:  s5 = -0.5  # mild PE dominance     → mildly bearish
+    else:             s5 = -1    # PE strongly dominant  → bearish
     components.append({"label": "PCR OI Level", "score": s5, "max": 1, "direction": _dir(s5), "note": f"PCR OI {pcr:.2f}"})
 
     # L2-b: Call Flow
@@ -522,7 +547,19 @@ def compute_composite_score(
     s7, pe_flow_label = _classify_pe_flow(chain_rows)
     components.append({"label": "Put OI Flow", "score": s7, "max": 2, "direction": _dir(s7), "note": pe_flow_label})
 
-    # L2-d: OI Wall position (call-wall above → bullish, put-wall below → bearish)
+    # L2-d: OI Wall position (call-wall above → resistance; put-wall below → support)
+    #
+    # Correct institutional interpretation:
+    #   spot >= call_wall  → spot at/above CALL resistance → CE buyers face a cap       → bearish (-1)
+    #   spot <= put_wall   → spot at/below PUT support  → put wall BROKEN → bearish    (-1)
+    #       When spot breaks below put_wall, institutional put writers are now in-the-money.
+    #       They hedge by selling futures → adds selling pressure → NOT support, BEARISH.
+    #   spot between walls → free to move → bias from whichever wall is closer:
+    #       Closer to put wall (from above) → near support → mild bullish (+0.5)
+    #       Closer to call wall (from below) → near resistance → mild bearish (-0.5)
+    #
+    # BUG FIXED: Old code gave +1 when spot<=put_wall ("downside supported") which is
+    # the OPPOSITE of correct. Spot below put_wall = put wall broken = BEARISH.
     s8 = 0
     cw = _call_wall(chain_rows)
     pw = _put_wall(chain_rows)
@@ -532,16 +569,19 @@ def compute_composite_score(
             # Spot between walls — direction from which wall is closer
             if (cw - spot) > (spot - pw):
                 s8 = 0.5
-                wall_note = f"Spot between walls (call wall {cw} far → mild bullish)"
+                wall_note = f"Spot between walls, near put support {pw:.0f} (call wall {cw:.0f} far) — mild bullish"
             else:
                 s8 = -0.5
-                wall_note = f"Spot between walls (put wall {pw} close → mild bearish)"
+                wall_note = f"Spot between walls, near call resistance {cw:.0f} (put wall {pw:.0f} far) — mild bearish"
         elif spot >= cw:
             s8 = -1
-            wall_note = f"Spot {spot} at/above call wall {cw} — overhead resistance"
+            wall_note = f"Spot {spot:.0f} at/above call wall {cw:.0f} — overhead resistance, bearish"
         elif spot <= pw:
-            s8 = 1
-            wall_note = f"Spot {spot} at/below put wall {pw} — downside supported"
+            # Put wall BROKEN: spot is below max PE OI strike.
+            # Put writers at {pw} are in-the-money — they hedge by selling futures.
+            # The 'support' narrative is wrong here; treat as bearish breakdown.
+            s8 = -1
+            wall_note = f"Spot {spot:.0f} below put wall {pw:.0f} — support broken, put writers hedging (bearish)"
     components.append({"label": "OI Wall Position", "score": s8, "max": 1, "direction": _dir(s8), "note": wall_note})
 
     # ── LAYER 3: Greeks Engine ───────────────────────────────────────────────
@@ -580,33 +620,54 @@ def compute_composite_score(
 
     # ── LAYER 4: Straddle & IV ───────────────────────────────────────────────
     # L4-a: IV Regime (IVR) — cheap options favour buyers, expensive penalise
+    # Partial scores added for 20–40% (mild buyer edge) and 50–60%
+    # (mild seller edge) so this component contributes in the mid-range
+    # that covers current market conditions (India VIX IVR ≈ 48.7%).
     s11 = 0
     iv_note = "IVR unavailable"
     if iv_rank is not None:
         if iv_rank < 20:
             s11 = 1
-            iv_note = f"IVR {iv_rank:.1f}% — cheap options, buyer structural edge"
-        elif iv_rank > 50:
+            iv_note = f"IVR {iv_rank:.1f}% — structurally cheap, full buyer edge"
+        elif iv_rank < 40:
+            s11 = 0.5
+            iv_note = f"IVR {iv_rank:.1f}% — moderate, mild buyer edge"
+        elif iv_rank > 60:
             s11 = -1
-            iv_note = f"IVR {iv_rank:.1f}% — expensive options, structural disadvantage"
+            iv_note = f"IVR {iv_rank:.1f}% — structurally expensive, buyer disadvantage"
+        elif iv_rank > 50:
+            s11 = -0.5
+            iv_note = f"IVR {iv_rank:.1f}% — elevated, mild seller edge"
         else:
-            iv_note = f"IVR {iv_rank:.1f}% — moderate"
+            iv_note = f"IVR {iv_rank:.1f}% — neutral zone (40–50%)"
     components.append({"label": "IV Regime (IVR)", "score": s11, "max": 1, "direction": _dir(s11), "note": iv_note})
 
     # L4-b: Straddle Velocity — expanding = real move, contracting = IV crush trap
+    # Thresholds calibrated for the 1-minute timeframe:
+    #   Old: ±3% for full score — rarely hit in a 60-second bar
+    #   New: ±1.5% full / ±0.5% partial — matches realistic 1-min straddle moves
+    # The 3% threshold was designed for 5-min+ bars where premium moves are larger.
     s12 = 0
     straddle_note = "Straddle velocity unavailable"
     straddle_vel  = "Flat"
     if straddle_price and prev_straddle_price and prev_straddle_price > 0:
         chg_pct = (straddle_price - prev_straddle_price) / prev_straddle_price * 100
-        if chg_pct >= 3:
+        if chg_pct >= 1.5:
             s12 = 2
             straddle_vel  = "Expanding"
             straddle_note = f"Straddle expanding {chg_pct:+.1f}% — real directional move, buyer edge"
-        elif chg_pct <= -3:
+        elif chg_pct >= 0.5:
+            s12 = 1
+            straddle_vel  = "Mild Expansion"
+            straddle_note = f"Straddle mild expansion {chg_pct:+.1f}% — modest premium growth"
+        elif chg_pct <= -1.5:
             s12 = -2
             straddle_vel  = "Contracting"
             straddle_note = f"Straddle contracting {chg_pct:+.1f}% — IV crush, avoid naked buying"
+        elif chg_pct <= -0.5:
+            s12 = -1
+            straddle_vel  = "Mild Contraction"
+            straddle_note = f"Straddle mild contraction {chg_pct:+.1f}% — premium fading"
         else:
             straddle_note = f"Straddle flat ({chg_pct:+.1f}%)"
     components.append({"label": "Straddle Velocity", "score": s12, "max": 2, "direction": _dir(s12), "note": straddle_note})
@@ -633,8 +694,11 @@ def compute_composite_score(
             s13 = 0
             sf_note = f"Wide option spread {spread_pct:.1f}% — executable cost degrades signal"
         elif prev_spot is not None and prev_sf_ltp is not None:
-            # Co-movement confirmation: BOTH spot AND SF must move together
-            move_threshold = spot * 0.0005   # 0.05% of spot (same as BuyerEdge)
+            # Co-movement confirmation: BOTH spot AND SF must move together.
+            # Threshold lowered from 0.05% → 0.03% of spot for 1-minute bars.
+            # At NIFTY 22000: old threshold = 11 pts/min; new = 6.6 pts/min.
+            # A 0.05% move in 60 seconds is a 3%/hr rate — too strict for intraday.
+            move_threshold = spot * 0.0003   # 0.03% of spot (1-min calibrated)
             spot_move = spot - prev_spot
             sf_move   = sf_ltp - prev_sf_ltp
             if spot_move > move_threshold and sf_move > move_threshold:
@@ -705,11 +769,15 @@ def compute_composite_score(
     trap_score = min(100, trap_score)
 
     # ── Final Score ──────────────────────────────────────────────────────────
-    # Max directional raw = 15 (1+1+1+1 + 1+2+2+1 + 1+0 + 1+2 + 1 = 15)
-    # NOTE: This strategy uses 15 components, not the 18-component BuyerEdge model.
-    # Scores from this engine are NOT directly comparable to BuyerEdge scores.
+    # Max achievable raw score = 13 (Gamma Regime is disabled, max=2 but always 0).
+    # Component maxes: 1+1+1+1 + 1+2+2+1 + 1+[0] + 1+2 + 1 = 15 declared,
+    # but Gamma's max=2 is dead weight — dividing by 15 permanently suppresses
+    # all scores by 13% and is the primary reason scores plateau at 0–+20.
+    # Denominator corrected to 13 (sum of actually achievable component maxes).
+    # When GEX integration is added, restore to 15 by including Gamma's max=2.
+    MAX_RAW_SCORE = 13  # 15 total − 2 (Gamma disabled)
     raw_score  = sum(c["score"] for c in components)
-    base_score = (raw_score / 15) * 100
+    base_score = (raw_score / MAX_RAW_SCORE) * 100
     # No gamma-flip multiplier (no GEX data available in this standalone script)
     final_score = int(max(-100, min(100, base_score)))
 

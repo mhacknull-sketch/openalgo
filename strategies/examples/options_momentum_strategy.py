@@ -130,10 +130,10 @@ SPOT_REWARD_PCT        = float(os.getenv("SPOT_REWARD_PCT",        "1.0"))  # % 
 TRAIL_ACTIVATE_AT_PCT  = float(os.getenv("TRAIL_ACTIVATE_AT_PCT",  "25.0")) # activate after 25 % of reward
 TRAIL_STEP_RR_PCT      = float(os.getenv("TRAIL_STEP_RR_PCT",      "50.0")) # trail width = reward * this/100
 
-# Long-only mode — when True, only buy CE (Call options); bearish PE signals are skipped.
-# Option Call buyers profit when the underlying moves UP.  Enable this to trade exclusively
-# bullish momentum (long calls only) which also simplifies risk-management state.
-LONG_ONLY_MODE   = os.getenv("LONG_ONLY_MODE",    "false").lower() in ("1", "true", "yes")
+# Long-Options mode — Options buyers profit when underlying moves UP (Buy CE)
+# or DOWN (Buy PE).  Since this strategy is an options buyer strategy, 
+# 'LONG_ONLY_MODE' means we buy both Calls and Puts. No short selling options.
+LONG_ONLY_MODE   = os.getenv("LONG_ONLY_MODE",    "true").lower() in ("1", "true", "yes")
 
 # Broker-side protective orders — immediately after a BUY entry fill, place:
 #   • SELL SL-M  at the initial stop-loss price   → protects against fast gaps / script crashes
@@ -191,7 +191,7 @@ ASYM_SCORE_THRESHOLD = float(os.getenv("ASYM_SCORE_THRESHOLD", "0.55"))
 # When false, a failed checkpoint strike selection skips the trade instead of
 # falling back to a simple OTM offset.  Safer for a long-options buyer because
 # thin OI / high IV / poor asymmetry usually means seller edge, not buyer edge.
-ALLOW_CHECKPOINT_FALLBACK = os.getenv("ALLOW_CHECKPOINT_FALLBACK", "false").lower() in ("1", "true", "yes")
+ALLOW_CHECKPOINT_FALLBACK = os.getenv("ALLOW_CHECKPOINT_FALLBACK", "true").lower() in ("1", "true", "yes")
 
 # Delta target range for strike selection.  Slightly OTM options for long buying
 # typically carry a delta of 0.25–0.45 (absolute value).
@@ -2517,11 +2517,10 @@ class OptionsMomentumBot:
             print(f"[SKIP] {symbol}: signal={signal}, not executing")
             return
 
-        # Long-only mode: only buy Call (CE) options — upward momentum trades.
-        # Option Call buyers profit when the underlying price moves UP.
-        # Bearish (PE) signals are skipped entirely in this mode.
-        if LONG_ONLY_MODE and direction != "CE":
-            print(f"[SKIP] {symbol}: LONG_ONLY_MODE — bullish signal required (got {direction})")
+        # Long-Options mode: Option buyers go long on momentum.
+        # CE buys for upward momentum, PE buys for downward momentum.
+        if not LONG_ONLY_MODE:
+            print(f"[SKIP] {symbol}: Strategy is long-options, but LONG_ONLY_MODE is disabled.")
             return
 
         # direction=None means truly neutral score — skip rather than default to PE.

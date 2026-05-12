@@ -37,8 +37,9 @@ Run via OpenAlgo's /python strategy runner:
     is for educational purposes; backtest before live use.
 
 KEY ENVIRONMENT VARIABLES
-    LONG_ONLY_MODE=true        — restrict to CE (Call) buying only; bearish PE
-                                 signals are skipped (default: false).
+    LONG_ONLY_MODE=true        — options buyer mode: Buy CE on bullish signals,
+                                 Buy PE on bearish signals.  No short-selling of
+                                 options in either direction (default: true).
     BROKER_SL_ORDERS=true      — place exchange-level SELL SL-M at the SL price
                                  and SELL LIMIT at the target price immediately
                                  after each BUY fill (default: true).  The trailing
@@ -53,11 +54,12 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta
 
 import pandas as pd
 
-from openalgo import api
+from openalgo import api, ta
 
 # ===============================================================================
 # CONFIGURATION — all tunable via environment variables
@@ -98,50 +100,37 @@ LOT_MULTIPLIER= int(os.getenv("LOT_MULTIPLIER","1"))    # lots to buy
 
 # Signal thresholds
 # ⚠ TESTING VALUES — restore to MIN_SCORE=50, MAX_TRAP=50 before production.
-# MIN_SCORE=5  : fires a trade on almost any non-zero score (stress-test execution path)
-# MAX_TRAP=100 : trap gate effectively disabled (all trap scores pass through)
-MIN_SCORE      = int(os.getenv("MIN_SCORE",    "5"))    # minimum |score| to trade
-MAX_TRAP       = int(os.getenv("MAX_TRAP",     "100"))  # maximum trap score to trade
+# MIN_SCORE=15  : fires a trade on almost any non-zero score (stress-test execution path)
+# MAX_TRAP=80   : trap gate effectively disabled (all trap scores pass through)
+MIN_SCORE      = int(os.getenv("MIN_SCORE",    "15"))    # minimum |score| to trade
+MAX_TRAP       = int(os.getenv("MAX_TRAP",     "80"))    # maximum trap score to trade
 
 # Risk Management — Premium SL / Target
-PREMIUM_STOP_PCT   = float(os.getenv("PREMIUM_STOP_PCT",    "40.0"))   # % loss from entry premium
+PREMIUM_STOP_PCT   = float(os.getenv("PREMIUM_STOP_PCT",    "30.0"))   # % loss from entry premium
 PREMIUM_TARGET_PCT = float(os.getenv("PREMIUM_TARGET_PCT",  "80.0"))   # % gain from entry premium
 
 # Session-level risk gates (set to 0 to disable each gate)
 MAX_TRADES_PER_SESSION    = int(os.getenv("MAX_TRADES_PER_SESSION",   "5"))   # 0 = unlimited
 MAX_CONSECUTIVE_LOSSES    = int(os.getenv("MAX_CONSECUTIVE_LOSSES",   "3"))   # 0 = unlimited
 ENTRY_COOLDOWN_SECS       = int(os.getenv("ENTRY_COOLDOWN_SECS",      "300")) # seconds between entries; 0 = none
-MAX_DAILY_LOSS_PCT        = float(os.getenv("MAX_DAILY_LOSS_PCT",     "2.0")) # % of account capital; 0 = disabled
-MAX_DAILY_LOSS_AMOUNT     = float(os.getenv("MAX_DAILY_LOSS_AMOUNT",  "0.0")) # absolute ₹ amount; 0 = disabled
+MAX_DAILY_LOSS_PCT        = float(os.getenv("MAX_DAILY_LOSS_PCT",     "0.0")) # % of account capital; 0 = disabled
+MAX_DAILY_LOSS_AMOUNT     = float(os.getenv("MAX_DAILY_LOSS_AMOUNT",  "2000.0")) # absolute ₹ amount; 0 = disabled
 RISK_PERCENT              = float(os.getenv("RISK_PERCENT",        "1.0"))    # max premium-risk % per trade
 
-# Trailing Stop Loss — switchable between spot-price based and option-premium based.
-#
-# TRAIL_SL_MODE controls which trailing SL engine(s) are active:
-#   "spot"    — trail based on underlying spot price (original behaviour, default)
-#   "premium" — trail based on the live option premium (LTP from WebSocket)
-#   "both"    — run both engines in parallel; first to trigger exits the trade
-#
-# For "spot" mode the trailing SL is a spot-point distance; for "premium" mode the
-# same TRAIL_ACTIVATE_AT_PCT / TRAIL_STEP_RR_PCT percentages are applied to the
-# option-premium reward distance (= entry_premium × PREMIUM_TARGET_PCT / 100).
-TRAIL_SL_MODE          = os.getenv("TRAIL_SL_MODE",            "spot")   # "spot" | "premium" | "both"
+# Trailing SL mode: "spot" (spot-point distance), "premium" (option LTP),
+# or "both" (run both; first to trigger exits). Percentages apply to the
+# reward distance (entry_premium × PREMIUM_TARGET_PCT / 100) in premium mode.
+TRAIL_SL_MODE          = os.getenv("TRAIL_SL_MODE",            "premium")   # "spot" | "premium" | "both"
 SPOT_REWARD_PCT        = float(os.getenv("SPOT_REWARD_PCT",        "1.0"))  # % spot move = full reward target
 TRAIL_ACTIVATE_AT_PCT  = float(os.getenv("TRAIL_ACTIVATE_AT_PCT",  "25.0")) # activate after 25 % of reward
-TRAIL_STEP_RR_PCT      = float(os.getenv("TRAIL_STEP_RR_PCT",      "50.0")) # trail width = reward * this/100
+TRAIL_STEP_RR_PCT      = float(os.getenv("TRAIL_STEP_RR_PCT",      "10.0")) # trail width = reward * this/100
 
-# Long-Options mode — Options buyers profit when underlying moves UP (Buy CE)
-# or DOWN (Buy PE).  Since this strategy is an options buyer strategy, 
-# 'LONG_ONLY_MODE' means we buy both Calls and Puts. No short selling options.
+# Long-only: BUY CE on bullish signal, BUY PE on bearish signal. No short selling.
 LONG_ONLY_MODE   = os.getenv("LONG_ONLY_MODE",    "true").lower() in ("1", "true", "yes")
 
-# Broker-side protective orders — immediately after a BUY entry fill, place:
-#   • SELL SL-M  at the initial stop-loss price   → protects against fast gaps / script crashes
-#   • SELL LIMIT at the target price               → locks in profit at the exchange level
-# The trailing-SL engine MODIFIES the broker SL order as the trail ratchets upward so that
-# the broker always holds the latest floor.  Software WebSocket monitoring runs in parallel
-# as a secondary layer for trailing logic.  On a software-initiated exit, pending broker
-# orders are cancelled first to avoid double-execution.
+# Broker-side protection: place SELL SL-M + SELL LIMIT at the broker immediately after
+# each BUY fill. Trailing SL engine modifies the broker SL-M as the trail ratchets up.
+# On software-initiated exit, pending broker orders are cancelled first.
 BROKER_SL_ORDERS = os.getenv("BROKER_SL_ORDERS",  "true").lower() in ("1", "true", "yes")
 
 # Technicals (spot candles)
@@ -154,43 +143,29 @@ RSI_PERIOD       = int(os.getenv("RSI_PERIOD", "14"))
 # Loop interval
 SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "60"))  # seconds
 
+# L2 OI/Vol/Premium SMA smoothing: 1 = no smoothing (default); N >= 2 = SMA of
+# last N chain snapshots per strike (recommended 3–5, larger = more lag).
+# ⚠ Not applied to ATM straddle velocity or delta imbalance (ATM strike can shift).
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "3"))
+
 # ── check_all_checkpoints / best-strike selection ────────────────────────────
 # Maximum IVR (IV Rank %) allowed for entry — buyer structural edge degrades
 # when options are expensive.  Matches check_all_checkpoints checkpoint 1.
 IV_RANK_MAX_ENTRY    = float(os.getenv("IV_RANK_MAX_ENTRY",    "40.0"))
 
-# ── IV 52-week range for IVR calculation ─────────────────────────────────────
-# Used by calculate_iv_rank() to derive a normalised IV Rank percentage:
-#   IVR = (current_iv - IV_52W_LOW) / (IV_52W_HIGH - IV_52W_LOW) * 100
-#
-# Defaults are grounded in India VIX 52-week research (as of May 11 2026):
-#   India VIX 52-week Low  :  8.72  (extremely calm market regime)
-#   India VIX 52-week High : 28.91  (peak volatility — major shock events)
-#   Current VIX            : 18.55  → IVR ≈ 48.7% (mid-range, moderate caution)
-#
-# The India VIX is derived from NIFTY ATM option prices and is directly
-# comparable to the 'iv' field returned by client.quotes() for NIFTY.
-# For BANKNIFTY or FINNIFTY, the raw IV from quotes may be slightly higher
-# (index-specific volatility premium); these defaults remain conservative.
-#
-# Update quarterly or after major volatility regime changes:
-#   export IV_52W_LOW=10.0
-#   export IV_52W_HIGH=35.0
+# 52-week IV range for IVR = (current_iv - low) / (high - low) * 100.
+# Defaults: India VIX low 8.72 / high 28.91 (May 2026 research). Update quarterly.
 IV_52W_LOW  = float(os.getenv("IV_52W_LOW",   "8.72"))   # India VIX 52-wk low  (May 2026)
 IV_52W_HIGH = float(os.getenv("IV_52W_HIGH",  "28.91"))  # India VIX 52-wk high (May 2026)
 
-# Liquidity gate — strikes below these thresholds are ignored when selecting
-# the best entry strike.  Matches check_all_checkpoints liquidity filter.
+# Liquidity gate — strikes below these thresholds are skipped during strike selection.
 MIN_OI_FILTER        = float(os.getenv("MIN_OI_FILTER",        "50000"))  # minimum OI per strike
 MIN_VOL_FILTER       = float(os.getenv("MIN_VOL_FILTER",       "10000"))  # minimum volume per strike
 
-# Asymmetry score threshold — a score below this means the risk/reward is not
-# attractive enough to enter even if the directional signal is positive.
+# Minimum asymmetry score for strike selection — below this, risk/reward is unattractive.
 ASYM_SCORE_THRESHOLD = float(os.getenv("ASYM_SCORE_THRESHOLD", "0.55"))
 
-# When false, a failed checkpoint strike selection skips the trade instead of
-# falling back to a simple OTM offset.  Safer for a long-options buyer because
-# thin OI / high IV / poor asymmetry usually means seller edge, not buyer edge.
+# When false, skip rather than fall back to OTM offset if no checkpoint strike qualifies.
 ALLOW_CHECKPOINT_FALLBACK = os.getenv("ALLOW_CHECKPOINT_FALLBACK", "true").lower() in ("1", "true", "yes")
 
 # Delta target range for strike selection.  Slightly OTM options for long buying
@@ -269,19 +244,8 @@ def calculate_iv_rank(
     iv_52w_high: float | None,
 ) -> float | None:
     """
-    Compute IV Rank as a percentage in the range [0, 100].
-
-    Formula:
-        IVR = (current_iv - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100
-
-    Returns None when any input is unavailable (52-week range not yet
-    exposed by the OpenAlgo SDK — gracefully disables the IVR gate).
-    Returns None when iv_52w_high <= iv_52w_low (degenerate / flat IV history).
-
-    When 52-week IV data becomes available from the broker SDK, pass
-    ``iv_52w_low`` and ``iv_52w_high`` to activate the full IVR filter.
-    Until then, the function returns None so entry decisions are not
-    blocked by a missing data source.
+    Compute IV Rank: (current_iv - low) / (high - low) * 100.
+    Returns None when any input is missing or high <= low (disables the gate gracefully).
     """
     if current_iv is None or iv_52w_low is None or iv_52w_high is None:
         return None
@@ -290,50 +254,92 @@ def calculate_iv_rank(
     return (current_iv - iv_52w_low) / (iv_52w_high - iv_52w_low) * 100
 
 
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
-    rs    = gain / loss.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
-
-
-def _macd(series: pd.Series, fast=12, slow=26, sig=9):
-    fast_ema = _ema(series, fast)
-    slow_ema = _ema(series, slow)
-    macd_line = fast_ema - slow_ema
-    sig_line  = _ema(macd_line, sig)
-    histogram = macd_line - sig_line
-    return macd_line, sig_line, histogram
-
-
-def _vwap(df: pd.DataFrame) -> pd.Series:
-    """Session-anchored VWAP, reset at each trading date."""
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    session = pd.Series(df.index.date, index=df.index)
-    cum_vol = df["volume"].groupby(session).cumsum()
-    cum_tvol = (typical * df["volume"]).groupby(session).cumsum()
-    return cum_tvol / cum_vol.replace(0, pd.NA)
-
-
-def _bbands(series: pd.Series, period=20, num_std=2.0):
-    mid   = series.rolling(period).mean()
-    std   = series.rolling(period).std(ddof=0)
-    upper = mid + num_std * std
-    lower = mid - num_std * std
-    return upper, mid, lower
-
-
 # ===============================================================================
-# OI / FLOW HELPERS (from raw option-chain rows)
+# OI / FLOW HELPERS — smoothing + 3-factor Price×Volume×OI classification
 # ===============================================================================
+
+def _smooth_chain_rows(history: list) -> list[dict]:
+    """
+    SMA-smooth per-strike OI/Volume/Premium across N snapshots (oldest-first list).
+    Appends six direction fields per row (ce/pe_ltp/vol/oi_dir: +1 rising, -1 falling, 0 flat)
+    for the 3-factor classifier. Returns single-bar snapshot unchanged (with zero trend flags).
+    """
+    if not history:
+        return []
+
+    # Single-bar: attach zero-trend flags and return unchanged
+    if len(history) == 1:
+        result = []
+        for row in history[0]:
+            r = dict(row)
+            r["ce_ltp_dir"] = 0; r["ce_vol_dir"] = 0; r["ce_oi_dir"] = 0
+            r["pe_ltp_dir"] = 0; r["pe_vol_dir"] = 0; r["pe_oi_dir"] = 0
+            result.append(r)
+        return result
+
+    # Build {strike: row} lookup for each snapshot
+    snaps = []
+    for snap in history:
+        d = {}
+        for row in snap:
+            k = row.get("strike")
+            if k is not None:
+                d[k] = row
+        snaps.append(d)
+
+    all_strikes = sorted({k for s in snaps for k in s})
+
+    SMOOTH_FIELDS = [
+        "ce_oi", "pe_oi",
+        "ce_volume", "pe_volume",
+        "ce_ltp", "pe_ltp",
+        "ce_oi_chg", "pe_oi_chg",
+        "ce_ltp_chg", "pe_ltp_chg",
+        "ce_bid", "ce_ask", "pe_bid", "pe_ask",
+    ]
+
+    smoothed = []
+    for strike in all_strikes:
+        rows = [s[strike] for s in snaps if strike in s]
+        if not rows:
+            continue
+
+        # Start from the newest snapshot's row (preserves non-numeric fields)
+        base = None
+        for s in reversed(snaps):
+            if strike in s:
+                base = dict(s[strike])
+                break
+        row_out = dict(base)
+
+        # SMA for each numeric field
+        for field in SMOOTH_FIELDS:
+            vals = [float(r.get(field) or 0) for r in rows]
+            row_out[field] = sum(vals) / len(vals)
+
+        # Trend: sign of (newest value − oldest value) for key fields
+        def _trend(field: str) -> int:
+            oldest = next((s[strike] for s in snaps      if strike in s), None)
+            newest = next((s[strike] for s in reversed(snaps) if strike in s), None)
+            if oldest is None or newest is None:
+                return 0
+            diff = float(newest.get(field) or 0) - float(oldest.get(field) or 0)
+            return 1 if diff > 0 else (-1 if diff < 0 else 0)
+
+        row_out["ce_ltp_dir"] = _trend("ce_ltp")
+        row_out["ce_vol_dir"] = _trend("ce_volume")
+        row_out["ce_oi_dir"]  = _trend("ce_oi")
+        row_out["pe_ltp_dir"] = _trend("pe_ltp")
+        row_out["pe_vol_dir"] = _trend("pe_volume")
+        row_out["pe_oi_dir"]  = _trend("pe_oi")
+
+        smoothed.append(row_out)
+
+    return smoothed
+
 
 def _compute_pcr(chain_rows: list[dict]) -> float:
-    """Put-Call Ratio by OI."""
+    """Put-Call Ratio by OI (works on raw or smoothed chain_rows)."""
     ce_oi = sum(r.get("ce_oi", 0) or 0 for r in chain_rows)
     pe_oi = sum(r.get("pe_oi", 0) or 0 for r in chain_rows)
     if ce_oi == 0:
@@ -353,46 +359,101 @@ def _put_wall(chain_rows: list[dict]) -> float | None:
     return max(chain_rows, key=lambda r: r.get("pe_oi", 0))["strike"]
 
 
-def _classify_ce_flow(chain_rows: list[dict]) -> tuple[int, str]:
+def _classify_ce_flow(chain_rows: list[dict]) -> tuple[float, str]:
     """
-    Classify Call flow from OI-change and premium-change columns.
-    Returns (score, label):
-      +2  Call Buying     (bullish — call buyers adding; increasing demand)
-      +1  Short Covering  (mildly bullish)
-      -1  Long Unwinding  (mildly bearish)
-      -2  Call Writing    (bearish/resistance — call sellers adding, cap overhead)
+    3-factor CE flow classifier: Price × Volume × OI (8-state matrix).
+    Uses direction fields from _smooth_chain_rows when LOOKBACK_BARS >= 2;
+    falls back to 2-factor OI-change × LTP-change on single-bar data.
+
+    Matrix (CE — positive scores = bullish for underlying):
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  LTP↑  Vol↑  OI↑  → +2   Call Buying — strong bullish conviction      │
+    │  LTP↑  Vol↑  OI↓  → +1   CE Short Covering — moderately bullish       │
+    │  LTP↑  Vol↓  OI↑  → +0.5 Low-vol CE accumulation — cautiously bullish │
+    │  LTP↑  Vol↓  OI↓  → 0    Fading CE interest — weakening (skip)        │
+    │  LTP↓  Vol↑  OI↑  → -2   Call Writing — strong bearish signal         │
+    │  LTP↓  Vol↑  OI↓  → -1   CE Long Unwinding — moderately bearish       │
+    │  LTP↓  Vol↓  OI↑  → -0.5 Low-vol call writing — cautiously bearish    │
+    │  LTP↓  Vol↓  OI↓  → 0    Fading CE pressure — weakening (skip)        │
+    └─────────────────────────────────────────────────────────────────────────┘
     """
+    # Aggregate trend direction flags (set by _smooth_chain_rows; 0 on single bar)
+    def _agg_dir(field: str) -> int:
+        raw = sum(r.get(field, 0) or 0 for r in chain_rows)
+        return 1 if raw > 0 else (-1 if raw < 0 else 0)
+
+    ce_ltp_dir = _agg_dir("ce_ltp_dir")
+    ce_vol_dir = _agg_dir("ce_vol_dir")
+    ce_oi_dir  = _agg_dir("ce_oi_dir")
+
+    # 3-factor model (LOOKBACK_BARS >= 2 → vol_dir available)
+    if ce_vol_dir != 0:
+        l, v, o = ce_ltp_dir, ce_vol_dir, ce_oi_dir
+        if   l ==  1 and v ==  1 and o ==  1: return  2.0, "Call Buying — strong bullish conviction"
+        elif l ==  1 and v ==  1 and o == -1: return  1.0, "CE Short Covering — moderately bullish"
+        elif l ==  1 and v == -1 and o ==  1: return  0.5, "CE accumulation low volume — cautiously bullish"
+        elif l ==  1 and v == -1 and o == -1: return  0.0, "CE fading interest — weakening"
+        elif l == -1 and v ==  1 and o ==  1: return -2.0, "Call Writing — strong bearish signal"
+        elif l == -1 and v ==  1 and o == -1: return -1.0, "CE Long Unwinding — moderately bearish"
+        elif l == -1 and v == -1 and o ==  1: return -0.5, "Call writing low volume — cautiously bearish"
+        elif l == -1 and v == -1 and o == -1: return  0.0, "CE pressure fading — weakening bearish"
+        return 0.0, "CE Neutral"
+
+    # 2-factor fallback (single bar, no volume trend)
     ce_oi_chg  = sum(r.get("ce_oi_chg", 0) or 0 for r in chain_rows)
     ce_ltp_chg = sum(r.get("ce_ltp_chg", 0) or 0 for r in chain_rows)
-    if ce_oi_chg > 0 and ce_ltp_chg > 0.5:
-        return 2, "Call Buying"
-    if ce_oi_chg < 0 and ce_ltp_chg > 0.5:
-        return 1, "CE Short Covering"
-    if ce_oi_chg > 0 and ce_ltp_chg < -0.5:
-        return -2, "Call Writing"
-    if ce_oi_chg < 0 and ce_ltp_chg < -0.5:
-        return -1, "CE Long Unwinding"
+    if ce_oi_chg > 0 and ce_ltp_chg > 0.5:  return  2, "Call Buying"
+    if ce_oi_chg < 0 and ce_ltp_chg > 0.5:  return  1, "CE Short Covering"
+    if ce_oi_chg > 0 and ce_ltp_chg < -0.5: return -2, "Call Writing"
+    if ce_oi_chg < 0 and ce_ltp_chg < -0.5: return -1, "CE Long Unwinding"
     return 0, "CE Neutral"
 
 
-def _classify_pe_flow(chain_rows: list[dict]) -> tuple[int, str]:
+def _classify_pe_flow(chain_rows: list[dict]) -> tuple[float, str]:
     """
-    Classify Put flow using the correct 4-state model (same as BuyerEdge):
-      OI↑ + premium↓ → Put Writing       (bullish, +2)
-      OI↑ + premium↑ → Put Buying        (bearish, −2)
-      OI↓ + premium↑ → PE Short Covering (mildly bullish, +1)
-      OI↓ + premium↓ → PE Long Unwinding (mildly bearish, −1)
+    3-factor PE flow classifier: Price × Volume × OI (8-state matrix, scores inverted vs CE).
+    PE LTP↑ = bearish for underlying; PE LTP↓ = bullish. Falls back to 2-factor on single bar.
+
+    Matrix (PE — positive scores = bullish for underlying):
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  PE_LTP↑  Vol↑  OI↑  → -2   Put Buying — strong bearish for underlying│
+    │  PE_LTP↑  Vol↑  OI↓  → -1   PE Short Covering — moderately bearish    │
+    │  PE_LTP↑  Vol↓  OI↑  → -0.5 Low-vol put accumulation — cautiously bear│
+    │  PE_LTP↑  Vol↓  OI↓  → 0    Fading put demand — weakening bearish     │
+    │  PE_LTP↓  Vol↑  OI↑  → +2   Put Writing — strong bullish for underlying│
+    │  PE_LTP↓  Vol↑  OI↓  → +1   PE Long Unwinding — moderately bullish    │
+    │  PE_LTP↓  Vol↓  OI↑  → +0.5 Low-vol put writing — cautiously bullish  │
+    │  PE_LTP↓  Vol↓  OI↓  → 0    Fading put pressure — weakening bullish   │
+    └─────────────────────────────────────────────────────────────────────────┘
     """
+    def _agg_dir(field: str) -> int:
+        raw = sum(r.get(field, 0) or 0 for r in chain_rows)
+        return 1 if raw > 0 else (-1 if raw < 0 else 0)
+
+    pe_ltp_dir = _agg_dir("pe_ltp_dir")
+    pe_vol_dir = _agg_dir("pe_vol_dir")
+    pe_oi_dir  = _agg_dir("pe_oi_dir")
+
+    # 3-factor model (LOOKBACK_BARS >= 2)
+    if pe_vol_dir != 0:
+        l, v, o = pe_ltp_dir, pe_vol_dir, pe_oi_dir
+        if   l ==  1 and v ==  1 and o ==  1: return -2.0, "Put Buying — strong bearish for underlying"
+        elif l ==  1 and v ==  1 and o == -1: return -1.0, "PE Short Covering — moderately bearish"
+        elif l ==  1 and v == -1 and o ==  1: return -0.5, "Put accumulation low volume — cautiously bearish"
+        elif l ==  1 and v == -1 and o == -1: return  0.0, "PE demand fading — weakening bearish"
+        elif l == -1 and v ==  1 and o ==  1: return  2.0, "Put Writing — strong bullish for underlying"
+        elif l == -1 and v ==  1 and o == -1: return  1.0, "PE Long Unwinding — moderately bullish"
+        elif l == -1 and v == -1 and o ==  1: return  0.5, "Put writing low volume — cautiously bullish"
+        elif l == -1 and v == -1 and o == -1: return  0.0, "PE pressure fading — weakening bullish"
+        return 0.0, "PE Neutral"
+
+    # 2-factor fallback (single bar)
     pe_oi_chg  = sum(r.get("pe_oi_chg", 0) or 0 for r in chain_rows)
     pe_ltp_chg = sum(r.get("pe_ltp_chg", 0) or 0 for r in chain_rows)
-    if pe_oi_chg > 0 and pe_ltp_chg < -0.5:
-        return 2, "Put Writing"
-    if pe_oi_chg > 0 and pe_ltp_chg > 0.5:
-        return -2, "Put Buying"
-    if pe_oi_chg < 0 and pe_ltp_chg > 0.5:
-        return 1, "PE Short Covering"
-    if pe_oi_chg < 0 and pe_ltp_chg < -0.5:
-        return -1, "PE Long Unwinding"
+    if pe_oi_chg > 0 and pe_ltp_chg < -0.5: return  2, "Put Writing"
+    if pe_oi_chg > 0 and pe_ltp_chg > 0.5:  return -2, "Put Buying"
+    if pe_oi_chg < 0 and pe_ltp_chg > 0.5:  return  1, "PE Short Covering"
+    if pe_oi_chg < 0 and pe_ltp_chg < -0.5: return -1, "PE Long Unwinding"
     return 0, "PE Neutral"
 
 
@@ -414,20 +475,14 @@ def compute_composite_score(
     ce_ask: float | None,
     pe_bid: float | None,
     pe_ask: float | None,
-    ce_delta: float | None = None,  # actual CE delta from optiongreeks(); overrides LTP proxy
-    pe_delta: float | None = None,  # actual PE delta from optiongreeks(); overrides LTP proxy
+    ce_delta: float | None = None,       # actual CE delta from optiongreeks()
+    pe_delta: float | None = None,       # actual PE delta from optiongreeks()
     prev_spot: float | None = None,      # previous scan's spot price (for SF co-movement)
     prev_sf_ltp: float | None = None,    # previous scan's synthetic-future price (for co-movement)
 ) -> dict:
     """
     Compute a composite directional score (−100 → +100) and trap_score (0 → 100).
-
-    The logic mirrors the 15-component BuyerEdge signal engine so that the
-    same institutional-grade checks used in the web tool are replicated here.
-
-    Returns a dict with keys:
-        score, label, signal, trap_score, trap_reasons,
-        reasons, direction, components
+    Returns dict: score, label, signal, direction, trap_score, trap_reasons, reasons, components.
     """
     components = []
     reasons    = []
@@ -440,8 +495,8 @@ def compute_composite_score(
     s1 = 0
     trend_note = "Insufficient candles"
     if df_spot is not None and len(df_spot) >= SLOW_EMA_PERIOD + 2:
-        fast = _ema(df_spot["close"], FAST_EMA_PERIOD)
-        slow = _ema(df_spot["close"], SLOW_EMA_PERIOD)
+        fast = ta.ema(df_spot["close"], period=FAST_EMA_PERIOD)
+        slow = ta.ema(df_spot["close"], period=SLOW_EMA_PERIOD)
         if fast.iloc[-2] > slow.iloc[-2] and fast.iloc[-3] <= slow.iloc[-3]:
             s1 = 1
             trend_note = f"Bullish EMA crossover ({FAST_EMA_PERIOD}/{SLOW_EMA_PERIOD})"
@@ -456,14 +511,11 @@ def compute_composite_score(
             trend_note = "Fast EMA below Slow EMA (bearish)"
     components.append({"label": "EMA Trend", "score": s1, "max": 1, "direction": _dir(s1), "note": trend_note})
 
-    # L1-b: RSI context
-    # Thresholds widened from 55/45 to 53/47 with 50-line partial scores
-    # to prevent the 45–55 dead zone from silencing this component on
-    # most intraday bars where RSI rarely reaches extreme levels.
+    # L1-b: RSI (thresholds 53/47 with 50-line partial scores for intraday sensitivity)
     s2 = 0
     rsi_note = "RSI unavailable"
     if df_spot is not None and len(df_spot) >= RSI_PERIOD + 2:
-        rsi = _rsi(df_spot["close"], RSI_PERIOD)
+        rsi = ta.rsi(df_spot["close"], period=RSI_PERIOD)
         rsi_val = rsi.iloc[-2]
         if rsi_val > 53:
             s2 = 1
@@ -485,7 +537,7 @@ def compute_composite_score(
     s3 = 0
     macd_note = "MACD unavailable"
     if df_spot is not None and len(df_spot) >= 35:
-        _, _, hist = _macd(df_spot["close"])
+        _, _, hist = ta.macd(df_spot["close"])
         h_now  = hist.iloc[-2]
         h_prev = hist.iloc[-3]
         if h_now > 0 and h_now > h_prev:
@@ -506,7 +558,7 @@ def compute_composite_score(
     s4 = 0
     vwap_note = "VWAP unavailable"
     if df_spot is not None and len(df_spot) >= 5 and "volume" in df_spot.columns:
-        vwap = _vwap(df_spot)
+        vwap = ta.vwap(df_spot["high"], df_spot["low"], df_spot["close"], df_spot["volume"])
         vwap_val = vwap.iloc[-2]
         if spot > vwap_val:
             s4 = 1
@@ -517,19 +569,8 @@ def compute_composite_score(
     components.append({"label": "Spot vs VWAP", "score": s4, "max": 1, "direction": _dir(s4), "note": vwap_note})
 
     # ── LAYER 2: OI Flow Intelligence ────────────────────────────────────────
-    # L2-a: PCR OI Level
-    # DIRECTIONAL interpretation (options buyer framework from playbook):
-    #   High PCR = PUT OI dominant = bearish flow (prefer PE)
-    #     PCR > 1.3 → bearish tilt | PCR > 1.1 → mildly bearish
-    #   Low PCR  = CALL OI dominant = bullish flow (prefer CE)
-    #     PCR < 0.8 → bullish tilt | PCR < 1.0 → mildly bullish
-    #
-    # WARNING: Do NOT use the contrarian interpretation (high PCR = bullish reversal).
-    # That is a retail myth. For an options buyer, follow the OI flow direction:
-    #   more PE OI = bearish bias → score negative (favour PE entry)
-    #   more CE OI = bullish bias → score positive (favour CE entry)
-    #
-    # Playbook reference: PCR < 0.9 → bullish, PCR > 1.3 → bearish.
+    # L2-a: PCR OI Level — follow OI flow direction (NOT contrarian reversal).
+    # PCR < 0.9 = CE dominant (bullish); PCR > 1.3 = PE dominant (bearish).
     pcr = _compute_pcr(chain_rows)
     s5 = 0
     if pcr <= 0.6:    s5 = 1     # CE strongly dominant  → bullish
@@ -547,19 +588,9 @@ def compute_composite_score(
     s7, pe_flow_label = _classify_pe_flow(chain_rows)
     components.append({"label": "Put OI Flow", "score": s7, "max": 2, "direction": _dir(s7), "note": pe_flow_label})
 
-    # L2-d: OI Wall position (call-wall above → resistance; put-wall below → support)
-    #
-    # Correct institutional interpretation:
-    #   spot >= call_wall  → spot at/above CALL resistance → CE buyers face a cap       → bearish (-1)
-    #   spot <= put_wall   → spot at/below PUT support  → put wall BROKEN → bearish    (-1)
-    #       When spot breaks below put_wall, institutional put writers are now in-the-money.
-    #       They hedge by selling futures → adds selling pressure → NOT support, BEARISH.
-    #   spot between walls → free to move → bias from whichever wall is closer:
-    #       Closer to put wall (from above) → near support → mild bullish (+0.5)
-    #       Closer to call wall (from below) → near resistance → mild bearish (-0.5)
-    #
-    # BUG FIXED: Old code gave +1 when spot<=put_wall ("downside supported") which is
-    # the OPPOSITE of correct. Spot below put_wall = put wall broken = BEARISH.
+    # L2-d: OI Wall position. Call wall above = resistance (bearish); put wall broken
+    # below spot = put writers ITM, selling pressure (also bearish). Between walls:
+    # bias by proximity — closer to put wall = mild bullish, closer to call = mild bearish.
     s8 = 0
     cw = _call_wall(chain_rows)
     pw = _put_wall(chain_rows)
@@ -586,29 +617,56 @@ def compute_composite_score(
 
     # ── LAYER 3: Greeks Engine ───────────────────────────────────────────────
     # L3-a: Delta Imbalance
-    # When actual greeks are available (from optiongreeks() API) the delta skew
-    # is computed directly: ce_delta + pe_delta (pe_delta is negative at ATM ≈ −0.5).
-    # A value < 0 means put side is heavier (bullish dealer exposure → bullish).
-    # A value > 0 means call side is heavier (bearish dealer exposure → bearish).
-    # Fallback: estimate from ATM LTP ratio when greeks are unavailable.
+    #
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │  DELTA THEORY — Options Buyer Perspective (Black-Scholes)             │
+    # │                                                                        │
+    # │  CE Delta : 0  →  +1   (Deep OTM → Deep ITM)                         │
+    # │  PE Delta : -1 →   0   (Deep ITM → Deep OTM)                         │
+    # │                                                                        │
+    # │  At strike K: CE_delta = Φ(d₁) ≈ +0.50 ATM;  PE_delta = Φ(d₁) − 1  │
+    # │  Delta sum: di = CE_delta + PE_delta = 2Φ(d₁) − 1                    │
+    # │    di > 0 → CE drifting ITM (bullish); di < 0 → PE drifting ITM      │
+    # │    Thresholds: ±0.05 full score, ±0.02 partial (NIFTY weekly, 7DTE)  │
+    # └────────────────────────────────────────────────────────────────────────┘
     s9 = 0
     di_note = "Delta imbalance unavailable"
     di = 0.0
+    _delta_computed = False  # sentinel — prevents LTP fallback when a method fires
+
+    # Method 1 (primary): ATM CE + PE delta sum via optiongreeks().
+    # di = CE_delta + PE_delta; positive = CE ITM (bullish), negative = PE ITM (bearish).
     if ce_delta is not None and pe_delta is not None:
-        # pe_delta is negative (~−0.5); ce_delta + pe_delta ≈ 0 at a symmetric ATM
         di = ce_delta + pe_delta
-        if di <= -0.05:    s9 = 1;    di_note = f"Delta skew {di:.3f} — put-heavy (bullish)"
-        elif di <= -0.02:  s9 = 0.5;  di_note = f"Delta skew {di:.3f} — mild put premium"
-        elif di >= 0.05:   s9 = -1;   di_note = f"Delta skew {di:.3f} — call-heavy (bearish)"
-        elif di >= 0.02:   s9 = -0.5; di_note = f"Delta skew {di:.3f} — mild call premium"
-        else:              di_note = f"Delta skew {di:.3f} — balanced"
-    elif atm_ce_ltp and atm_pe_ltp and atm_pe_ltp > 0:
-        di = (atm_pe_ltp - atm_ce_ltp) / ((atm_pe_ltp + atm_ce_ltp) / 2)
-        if di >= 0.10:    s9 = 1;   di_note = f"Delta bias {di:.3f} — put premium heavy (bullish)"
-        elif di >= 0.05:  s9 = 0.5; di_note = f"Delta bias {di:.3f} — mild put premium"
-        elif di <= -0.10: s9 = -1;  di_note = f"Delta bias {di:.3f} — call premium heavy (bearish)"
-        elif di <= -0.05: s9 = -0.5;di_note = f"Delta bias {di:.3f} — mild call premium"
-        else:             di_note = f"Delta bias {di:.3f} — balanced"
+        if di >= 0.05:
+            s9 = 1;    di_note = f"ATM Δ sum {di:+.3f} — CE ITM, net bullish  (CE {ce_delta:+.3f} / PE {pe_delta:+.3f})"
+        elif di >= 0.02:
+            s9 = 0.5;  di_note = f"ATM Δ sum {di:+.3f} — mild CE dominance   (CE {ce_delta:+.3f} / PE {pe_delta:+.3f})"
+        elif di <= -0.05:
+            s9 = -1;   di_note = f"ATM Δ sum {di:+.3f} — PE ITM, net bearish  (CE {ce_delta:+.3f} / PE {pe_delta:+.3f})"
+        elif di <= -0.02:
+            s9 = -0.5; di_note = f"ATM Δ sum {di:+.3f} — mild PE dominance   (CE {ce_delta:+.3f} / PE {pe_delta:+.3f})"
+        else:
+            di_note = f"ATM Δ sum {di:+.3f} — balanced (CE {ce_delta:+.3f} / PE {pe_delta:+.3f})"
+        _delta_computed = True
+
+    # Method 2 (rejected): OI-weighted chain delta — measures writer hedging
+    # (~70–80% NSE OI = writers), duplicates L2 PCR/OI flow, wrong for Greeks layer.
+
+    # LTP fallback (no Greeks data): (CE − PE) / midpoint → range (−2, +2).
+    if not _delta_computed and atm_ce_ltp and atm_pe_ltp and atm_pe_ltp > 0:
+        di = (atm_ce_ltp - atm_pe_ltp) / ((atm_ce_ltp + atm_pe_ltp) / 2)
+        if di >= 0.10:
+            s9 = 1;    di_note = f"LTP proxy Δ {di:+.3f} — CE premium heavy (bullish)"
+        elif di >= 0.05:
+            s9 = 0.5;  di_note = f"LTP proxy Δ {di:+.3f} — mild CE premium"
+        elif di <= -0.10:
+            s9 = -1;   di_note = f"LTP proxy Δ {di:+.3f} — PE premium heavy (bearish)"
+        elif di <= -0.05:
+            s9 = -0.5; di_note = f"LTP proxy Δ {di:+.3f} — mild PE premium"
+        else:
+            di_note = f"LTP proxy Δ {di:+.3f} — balanced"
+
     components.append({"label": "Greeks Bias (Δ)", "score": s9, "max": 1, "direction": _dir(s9), "note": di_note})
 
     # L3-b: Gamma Regime — regime context (same as BuyerEdge component 11)
@@ -619,10 +677,7 @@ def compute_composite_score(
     components.append({"label": "Gamma Regime", "score": s10, "max": 2, "direction": "neutral", "note": gamma_note})
 
     # ── LAYER 4: Straddle & IV ───────────────────────────────────────────────
-    # L4-a: IV Regime (IVR) — cheap options favour buyers, expensive penalise
-    # Partial scores added for 20–40% (mild buyer edge) and 50–60%
-    # (mild seller edge) so this component contributes in the mid-range
-    # that covers current market conditions (India VIX IVR ≈ 48.7%).
+    # L4-a: IV Regime (IVR) — <20% full buyer edge, <40% mild, >60% full seller edge.
     s11 = 0
     iv_note = "IVR unavailable"
     if iv_rank is not None:
@@ -642,11 +697,7 @@ def compute_composite_score(
             iv_note = f"IVR {iv_rank:.1f}% — neutral zone (40–50%)"
     components.append({"label": "IV Regime (IVR)", "score": s11, "max": 1, "direction": _dir(s11), "note": iv_note})
 
-    # L4-b: Straddle Velocity — expanding = real move, contracting = IV crush trap
-    # Thresholds calibrated for the 1-minute timeframe:
-    #   Old: ±3% for full score — rarely hit in a 60-second bar
-    #   New: ±1.5% full / ±0.5% partial — matches realistic 1-min straddle moves
-    # The 3% threshold was designed for 5-min+ bars where premium moves are larger.
+    # L4-b: Straddle Velocity — ±1.5% full / ±0.5% partial (1-min calibrated).
     s12 = 0
     straddle_note = "Straddle velocity unavailable"
     straddle_vel  = "Flat"
@@ -673,15 +724,8 @@ def compute_composite_score(
     components.append({"label": "Straddle Velocity", "score": s12, "max": 2, "direction": _dir(s12), "note": straddle_note})
 
     # ── LAYER 5: Synthetic Futures (spot-SF co-movement) ────────────────────
-    # Mirrors BuyerEdge component 14.
-    #
-    # IMPORTANT: Raw basis sign (SF − spot) is NOT used as a directional signal.
-    # BuyerEdge and this strategy both require BOTH spot AND synthetic future to
-    # move in the same direction between the previous scan and the current scan
-    # to score bullish or bearish.  A large basis alone (backwardation / carry)
-    # is informational but does NOT contribute a directional score.
-    #
-    # Wide bid-ask on the option suppresses the signal (executable cost too high).
+    # Both spot AND SF must move together between scans to score. Raw basis alone
+    # (backwardation/carry) gives no directional vote. Wide spread suppresses signal.
     s13 = 0
     sf_note = "SF data unavailable"
     if sf_ltp and spot:
@@ -694,10 +738,7 @@ def compute_composite_score(
             s13 = 0
             sf_note = f"Wide option spread {spread_pct:.1f}% — executable cost degrades signal"
         elif prev_spot is not None and prev_sf_ltp is not None:
-            # Co-movement confirmation: BOTH spot AND SF must move together.
-            # Threshold lowered from 0.05% → 0.03% of spot for 1-minute bars.
-            # At NIFTY 22000: old threshold = 11 pts/min; new = 6.6 pts/min.
-            # A 0.05% move in 60 seconds is a 3%/hr rate — too strict for intraday.
+            # Both must exceed 0.03% of spot to confirm co-movement (1-min calibrated).
             move_threshold = spot * 0.0003   # 0.03% of spot (1-min calibrated)
             spot_move = spot - prev_spot
             sf_move   = sf_ltp - prev_sf_ltp
@@ -799,9 +840,7 @@ def compute_composite_score(
         signal = "NO_TRADE"
 
     label = "Bullish" if final_score > 15 else "Bearish" if final_score < -15 else "Neutral"
-    # Entry direction — None for a truly neutral score (score == 0) so callers
-    # skip entry rather than defaulting to one side arbitrarily.
-    # CE = bullish (positive score), PE = bearish (negative), None = neutral (no entry).
+    # CE = bullish, PE = bearish, None = truly neutral (skip rather than default to a side)
     if final_score > 0:
         direction: str | None = "CE"
     elif final_score < 0:
@@ -869,12 +908,7 @@ def select_option_strike(
 # ===============================================================================
 
 class OptionsMomentumBot:
-    """
-    Multi-layer options momentum bot.
-
-    Each underlying is scanned independently. Positions are tracked in a
-    simple dict keyed by underlying.  SL/Target are monitored via WebSocket LTP.
-    """
+    """Multi-layer options momentum bot. Each underlying scanned independently."""
 
     def __init__(self):
         self.client = api(api_key=API_KEY, host=API_HOST, ws_url=WS_URL)
@@ -904,10 +938,11 @@ class OptionsMomentumBot:
         # straddle velocity can be computed without a local 1%-proxy hack.
         self._prev_straddle: dict[str, float] = {}
 
-        # ── Per-underlying previous spot and SF price for co-movement scoring ─
-        # Required by compute_composite_score for the BuyerEdge-aligned s13 signal.
+        # Per-underlying scan-state: previous spot/SF for s13 co-movement scoring;
+        # chain history for L2 OI/Vol/Premium SMA smoothing (ATM uses raw chain).
         self._prev_spot: dict[str, float] = {}   # underlying → previous spot
         self._prev_sf:   dict[str, float] = {}   # underlying → previous SF price
+        self._chain_history: dict[str, deque] = {}
 
         # ── Session / Daily Risk State ────────────────────────────────────────
         self.session_date              = datetime.now().strftime("%Y-%m-%d")
@@ -948,16 +983,14 @@ class OptionsMomentumBot:
             self.daily_pnl                  = 0.0
             self.last_entry_time            = None
             self._prev_straddle.clear()
+            self._prev_spot.clear()
+            self._prev_sf.clear()
+            self._chain_history.clear()
 
     # ── Telegram Alerts ───────────────────────────────────────────────────────
 
     def _send_telegram(self, message: str, priority: int = 5):
-        """
-        Send a Telegram alert via the OpenAlgo client.
-        Silently skipped when TELEGRAM_USERNAME is not configured.
-        The client.telegram() call is non-blocking — failures are logged and
-        swallowed so they never interrupt trading logic.
-        """
+        """Send a Telegram alert. Silently skipped if TELEGRAM_USERNAME is unset."""
         if not TELEGRAM_USERNAME:
             return
         try:
@@ -972,12 +1005,7 @@ class OptionsMomentumBot:
     # ── Startup Position Check ────────────────────────────────────────────────
 
     def _check_open_positions_on_startup(self):
-        """
-        Query the broker positionbook at startup and warn if NRML positions
-        that belong to this strategy's underlyings are already open.
-        This can happen after an unexpected restart.  The bot cannot auto-recover
-        SL / target state for these positions, so the operator must handle them.
-        """
+        """Warn about open NRML positions found at startup (e.g. after a crash)."""
         try:
             pb = self.client.positionbook()
             if not pb or pb.get("status") != "success":
@@ -1009,19 +1037,11 @@ class OptionsMomentumBot:
     # ── Underlying exchange helper ─────────────────────────────────────────────
 
     def _underlying_exchange(self, symbol: str) -> str:
-        """Return the exchange used for a given underlying symbol.
-
-        Index underlyings (NIFTY, BANKNIFTY, …) trade on NSE_INDEX / BSE_INDEX,
-        not NSE/BSE.  This matters for optionchain(), syntheticfuture(), and
-        optiongreeks() API calls that require the underlying's exchange.
-        """
+        """Return NSE_INDEX/BSE_INDEX for index underlyings, else SPOT_EXCHANGE."""
         return INDEX_EXCHANGE if symbol in INDEX_UNDERLYINGS else SPOT_EXCHANGE
 
     def _available_capital(self) -> float:
-        """
-        Return live available cash from OpenAlgo funds(), falling back to
-        `0.0` only when the broker/API response is unavailable.
-        """
+        """Return live available cash from funds(), falling back to 0.0."""
         try:
             resp = self.client.funds()
             data = resp.get("data", {}) if isinstance(resp, dict) else {}
@@ -1231,10 +1251,17 @@ class OptionsMomentumBot:
             print(f"[WS] Subscribe error: {exc}")
 
     def _subscribe_spot(self, symbol: str):
-        """Subscribe to underlying spot LTP feed."""
+        """Subscribe to underlying spot LTP feed.
+
+        Uses the correct exchange for the underlying — NSE_INDEX for index
+        underlyings (NIFTY, BANKNIFTY, …) and SPOT_EXCHANGE (NSE/BSE) for
+        equity underlyings.  Using SPOT_EXCHANGE for indices was incorrect;
+        the WebSocket proxy would silently fail to match ticks and the
+        spot-based trailing SL would never fire.
+        """
         try:
             self.client.subscribe_ltp(
-                [{"exchange": SPOT_EXCHANGE, "symbol": symbol}],
+                [{"exchange": self._underlying_exchange(symbol), "symbol": symbol}],
                 on_data_received=self._on_ws_data,
             )
             print(f"[WS] Subscribed spot {symbol}")
@@ -1249,7 +1276,7 @@ class OptionsMomentumBot:
 
     def _unsubscribe_spot(self, symbol: str):
         try:
-            self.client.unsubscribe_ltp([{"exchange": SPOT_EXCHANGE, "symbol": symbol}])
+            self.client.unsubscribe_ltp([{"exchange": self._underlying_exchange(symbol), "symbol": symbol}])
         except Exception:
             pass
 
@@ -1389,13 +1416,16 @@ class OptionsMomentumBot:
             except Exception as exc:
                 print(f"[DATA] syntheticfuture error for {symbol}: {exc}")
 
-        # Fallback: raw near-month futures quote (equity underlyings or API failure)
-        # Note: For equity underlyings, synthetic future API is unavailable and futures
-        # symbols require expiry dates (e.g., ICICIBANK24MAYFUT), so skip for now.
-        if symbol in INDEX_UNDERLYINGS:
-            sf_q = self._fetch_quote(f"{symbol}FUT", FNO_EXCHANGE)
+        # Fallback: raw near-month futures quote using the expiry already in scope.
+        # The canonical NSE/BSE futures symbol is <SYMBOL><DDMMMYY>FUT
+        # (e.g., "NIFTY25MAY25FUT").  The `expiry` parameter is already in DDMMMYY format
+        if expiry:
+            fut_symbol = f"{symbol}{expiry}FUT"
+            sf_q = self._fetch_quote(fut_symbol, FNO_EXCHANGE)
             ltp  = float(sf_q.get("ltp", 0) or 0)
-            return ltp if ltp else None
+            if ltp:
+                return ltp
+            print(f"[DATA] syntheticfuture fallback: {fut_symbol} returned no LTP")
         return None
 
     def _fetch_atm_greeks(
@@ -1708,42 +1738,6 @@ class OptionsMomentumBot:
         print(f"[ORDER] {order_id} still pending after {max_retries} retries - keeping for reconciliation")
         return last_status, None, last_data
 
-    def _get_executed_price(
-        self,
-        order_id: str,
-        max_retries: int = ORDER_STATUS_MAX_RETRIES,
-        sleep_secs: float = ORDER_STATUS_POLL_INTERVAL,
-    ) -> float | None:
-        """
-        Poll orderstatus until the order reaches a terminal state.
-
-        Returns:
-          float  — average fill price when status is 'complete'.
-          None   — when status is 'rejected' or 'cancelled' (no fill).
-          None   — when still open/pending after *max_retries* attempts (caller
-                   should treat the order as a pending entry and keep tracking it
-                   via the order_id rather than abandoning it).
-        """
-        for attempt in range(max_retries):
-            time.sleep(sleep_secs)
-            try:
-                resp = self.client.orderstatus(
-                    order_id=order_id, strategy=self.strategy_name
-                )
-                od = resp.get("data", {})
-                if od.get("order_status") == "complete":
-                    p = float(od.get("average_price", 0))
-                    if p > 0:
-                        return p
-                if od.get("order_status") in ("rejected", "cancelled"):
-                    print(f"[ORDER] Order {order_id} {od.get('order_status')} — no fill")
-                    return None
-            except Exception as exc:
-                print(f"[ORDER] orderstatus poll error (attempt {attempt + 1}): {exc}")
-        # Still pending after all retries — caller should NOT abandon the order
-        print(f"[ORDER] {order_id} still pending after {max_retries} retries — keeping for reconciliation")
-        return None
-
     # ── Broker Order Helpers ─────────────────────────────────────────────────
 
     def _cancel_broker_orders(self, underlying: str) -> dict | None:
@@ -1925,12 +1919,15 @@ class OptionsMomentumBot:
                     except Exception as exc:
                         print(f"[CANCEL] {ul}: complementary cancel failed: {exc}")
 
-                # Unsubscribe WebSocket feeds and remove position
+                # Unsubscribe WebSocket feeds and remove position.
+                # state_lock must be held when mutating positions to avoid a race
+                # with _strategy_thread / _ws_thread reading the positions dict.
                 self._unsubscribe(FNO_EXCHANGE, opt_sym)
                 if TRAIL_SL_MODE in ("spot", "both"):
                     self._unsubscribe_spot(pos.get("spot_symbol", ul))
-                self.positions.pop(ul, None)
-                self._prev_straddle.pop(ul, None)
+                with self.state_lock:
+                    self.positions.pop(ul, None)
+                    self._prev_straddle.pop(ul, None)
                 with self.exit_lock:
                     self.exit_queue.discard(opt_sym)
 
@@ -2350,6 +2347,12 @@ class OptionsMomentumBot:
             print(f"[SCAN] {symbol}: empty option chain, skipping")
             return
 
+        # SMA-smooth chain OI/Vol/Premium over LOOKBACK_BARS bars for L2 signals.
+        # Raw chain_rows kept for ATM extraction, straddle velocity, and delta.
+        _hist = self._chain_history.setdefault(symbol, deque(maxlen=max(1, LOOKBACK_BARS)))
+        _hist.append(chain_rows)
+        chain_rows_smooth = _smooth_chain_rows(list(_hist))
+
         # Use the expiry returned by the chain API (may contain canonical formatting).
         # Fall back to the pre-selected target_expiry if the API doesn't echo it back.
         expiry_used = chain_expiry or target_expiry
@@ -2415,7 +2418,7 @@ class OptionsMomentumBot:
         result = compute_composite_score(
             spot                = spot,
             df_spot             = df_spot,
-            chain_rows          = chain_rows,
+            chain_rows          = chain_rows_smooth,
             atm_ce_ltp          = atm_ce_ltp,
             atm_pe_ltp          = atm_pe_ltp,
             iv_rank             = iv_rank,
@@ -2453,6 +2456,7 @@ class OptionsMomentumBot:
 
         # Long-Options mode: Option buyers go long on momentum.
         # CE buys for upward momentum, PE buys for downward momentum.
+        # Both are options-buyer (long) trades — no short-selling of options here.
         if not LONG_ONLY_MODE:
             print(f"[SKIP] {symbol}: Strategy is long-options, but LONG_ONLY_MODE is disabled.")
             return
@@ -2466,7 +2470,7 @@ class OptionsMomentumBot:
         # Step 1: try the check_all_checkpoints liquidity + asymmetry score filter.
         #   This selects the OTM strike with the best institutional-edge profile
         #   (OI concentration, IV regime, delta range).
-        opt_row = self._select_best_strike(symbol, chain_rows, spot, direction, iv_rank)
+        opt_row = self._select_best_strike(symbol, chain_rows_smooth, spot, direction, iv_rank)
 
         # Step 2: if no strike passes the checkpoint criteria, fall back to the
         #   OTM_OFFSET-based simple selection so the strategy can still enter when
@@ -2615,11 +2619,16 @@ class OptionsMomentumBot:
             except Exception as exc:
                 print(f"[STRATEGY ERROR] {exc}")
 
-            # Clock-anchored sync: sleep until the start of the next minute
-            # instead of a fixed 60s sleep. This ensures bar alignment.
+            # Clock-anchored sync: sleep to the next multiple of SIGNAL_CHECK_INTERVAL
+            # from the epoch so scans align to regular boundaries (e.g., every minute
+            # at 09:15:00, 09:16:00, … rather than drifting based on scan duration).
+            # SIGNAL_CHECK_INTERVAL=60 → standard 1-minute bar alignment.
+            # SIGNAL_CHECK_INTERVAL=30 → 30-second polling (2 scans per minute bar).
+            interval = max(SIGNAL_CHECK_INTERVAL, 1)
             now = time.time()
-            sleep_secs = 60 - (now % 60)
-            if sleep_secs < 1: sleep_secs += 60
+            sleep_secs = interval - (now % interval)
+            if sleep_secs < 0.5:
+                sleep_secs += interval
             time.sleep(sleep_secs)
 
     # ── Run ──────────────────────────────────────────────────────────────────

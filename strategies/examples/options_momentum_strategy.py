@@ -1096,184 +1096,112 @@ class OptionsMomentumBot:
 
     # ── WebSocket ─────────────────────────────────────────────────────────────
 
-    def _on_ltp(self, data: dict):
+    def _on_ws_data(self, data: dict):
+        """Unified WebSocket dispatcher for option LTPs and spot LTPs."""
         if data.get("type") != "market_data":
             return
         sym = data.get("symbol", "")
         ltp = float(data.get("data", {}).get("ltp", 0) or 0)
         if not ltp:
             return
-        self.ltp_map[sym] = ltp
 
-        # Check premium-based SL / Target for this option symbol
-        for ul, pos in list(self.positions.items()):
-            if pos.get("symbol") != sym:
-                continue
-            with self.exit_lock:
-                if sym in self.exit_queue:
-                    continue
-                entry = pos["entry_premium"]
-                sl    = pos["sl"]
-                tgt   = pos["tgt"]
-                reason = None
+        with self.state_lock:
+            self.ltp_map[sym] = ltp
+            positions_snapshot = list(self.positions.items())
 
-                # ── Fixed premium SL / target ──────────────────────────────
-                if ltp <= sl:
-                    reason = f"STOPLOSS HIT (LTP {ltp:.2f} ≤ SL {sl:.2f})"
-                elif ltp >= tgt:
-                    reason = f"TARGET HIT (LTP {ltp:.2f} ≥ TGT {tgt:.2f})"
+        # Process each position against this tick
+        for ul, pos in positions_snapshot:
+            # ── A. Option LTP (Premium-based SL / Target / Trail) ──────────
+            if pos.get("symbol") == sym:
+                with self.exit_lock:
+                    if sym in self.exit_queue:
+                        continue
+                    entry = pos["entry_premium"]
+                    sl    = pos["sl"]
+                    tgt   = pos["tgt"]
+                    reason = None
 
-                # ── Option-premium trailing SL ─────────────────────────────
-                # Active only when TRAIL_SL_MODE is "premium" or "both".
-                # Logic mirrors the spot-based trail but operates on the option
-                # LTP directly, which is more responsive than spot price for
-                # short-DTE or high-gamma strikes.
-                #
-                # Full reward distance = entry_premium × PREMIUM_TARGET_PCT / 100
-                # Activates when:  ltp ≥ entry + reward × TRAIL_ACTIVATE_AT_PCT/100
-                # Trail width    :  reward × TRAIL_STEP_RR_PCT / 100
-                # Trail SL       :  peak_ltp − trail_width  (ratchets upward)
-                #
-                # OpenAlgo WebSocket LTP is used as the source — no manual
-                # polling loop needed; each tick drives this check directly.
-                elif TRAIL_SL_MODE in ("premium", "both"):
-                    reward      = entry * (PREMIUM_TARGET_PCT / 100.0)
-                    activate_at = reward * (TRAIL_ACTIVATE_AT_PCT / 100.0)
-                    trail_width = reward * (TRAIL_STEP_RR_PCT    / 100.0)
-                    move        = ltp - entry   # positive = profit for long option
+                    if ltp <= sl:
+                        reason = f"STOPLOSS HIT (LTP {ltp:.2f} ≤ SL {sl:.2f})"
+                    elif ltp >= tgt:
+                        reason = f"TARGET HIT (LTP {ltp:.2f} ≥ TGT {tgt:.2f})"
+                    elif TRAIL_SL_MODE in ("premium", "both"):
+                        reward      = entry * (PREMIUM_TARGET_PCT / 100.0)
+                        activate_at = reward * (TRAIL_ACTIVATE_AT_PCT / 100.0)
+                        trail_width = reward * (TRAIL_STEP_RR_PCT    / 100.0)
+                        move        = ltp - entry
 
-                    if move >= activate_at:
-                        if not pos.get("premium_trail_active"):
-                            pos["premium_trail_active"] = True
-                            pos["premium_trail_peak"]   = ltp
-                            pos["premium_trail_sl"]     = round(ltp - trail_width, 2)
-                            print(
-                                f"[TRAIL-P] {ul} {pos['option_type']} — premium trail activated | "
-                                f"peak={ltp:.2f} | trail_sl={pos['premium_trail_sl']:.2f}"
-                            )
-                            # Raise broker SL order to the new trail floor
-                            self._modify_broker_sl(ul, pos["premium_trail_sl"])
-                        else:
-                            if ltp > pos["premium_trail_peak"]:
+                        if move >= activate_at:
+                            if not pos.get("premium_trail_active"):
+                                pos["premium_trail_active"] = True
+                                pos["premium_trail_peak"]   = ltp
+                                pos["premium_trail_sl"]     = round(ltp - trail_width, 2)
+                                print(f"[TRAIL-P] {ul} — premium trail activated | peak={ltp:.2f} | sl={pos['premium_trail_sl']:.2f}")
+                                self._modify_broker_sl(ul, pos["premium_trail_sl"])
+                            elif ltp > pos["premium_trail_peak"]:
                                 pos["premium_trail_peak"] = ltp
                                 pos["premium_trail_sl"]   = round(ltp - trail_width, 2)
-                                print(
-                                    f"[TRAIL-P] {ul} {pos['option_type']} — trail raised | "
-                                    f"peak={ltp:.2f} | trail_sl={pos['premium_trail_sl']:.2f}"
-                                )
-                                # Raise broker SL order to the new trail floor
+                                print(f"[TRAIL-P] {ul} — trail raised | peak={ltp:.2f} | sl={pos['premium_trail_sl']:.2f}")
                                 self._modify_broker_sl(ul, pos["premium_trail_sl"])
 
-                        if ltp <= pos["premium_trail_sl"]:
-                            reason = (
-                                f"PREMIUM TRAILING SL HIT "
-                                f"(LTP {ltp:.2f} ≤ trail_sl {pos['premium_trail_sl']:.2f})"
-                            )
+                            if ltp <= pos["premium_trail_sl"]:
+                                reason = f"PREMIUM TRAILING SL HIT (LTP {ltp:.2f} ≤ trail_sl {pos['premium_trail_sl']:.2f})"
 
-                if reason:
-                    self.exit_queue.add(sym)
-                    print(f"\n[ALERT] {ul} {pos['option_type']}: {reason}")
-                    t = threading.Thread(
-                        target=self._place_exit, args=(ul, reason), daemon=True
-                    )
-                    t.start()
+                    if reason:
+                        self.exit_queue.add(sym)
+                        print(f"\n[ALERT] {ul} {pos['option_type']}: {reason}")
+                        threading.Thread(target=self._place_exit, args=(ul, reason), daemon=True).start()
 
-    def _on_spot_ltp(self, data: dict):
-        """
-        Handle real-time spot LTP updates for spot-based trailing stop loss.
+            # ── B. Spot LTP (Spot-based Trailing SL) ───────────────────────
+            elif pos.get("spot_symbol") == sym and TRAIL_SL_MODE in ("spot", "both"):
+                opt_sym = pos["symbol"]
+                with self.exit_lock:
+                    if opt_sym in self.exit_queue:
+                        continue
+                    
+                    direction   = pos["option_type"]
+                    spot_entry  = pos["spot_entry"]
+                    reward_dist = pos["reward_dist"]
+                    activate_at = reward_dist * (TRAIL_ACTIVATE_AT_PCT / 100.0)
+                    trail_width = reward_dist * (TRAIL_STEP_RR_PCT / 100.0)
+                    spot        = ltp
+                    reason      = None
 
-        Trailing SL design (per TRAIL_* config):
-          • Full reward distance = spot_entry × SPOT_REWARD_PCT / 100
-          • Trail activates when spot moves ≥ TRAIL_ACTIVATE_AT_PCT % of reward dist
-            toward the target direction (up for CE, down for PE).
-          • Once active: trailing stop = (peak_spot - trail_width)  for CE
-                                         (trough_spot + trail_width) for PE
-            where trail_width = reward_dist × TRAIL_STEP_RR_PCT / 100
-          • If spot breaks the trailing stop, the option position is closed.
-
-        Only runs when TRAIL_SL_MODE is "spot" or "both".
-        """
-        if TRAIL_SL_MODE == "premium":
-            return   # spot trailing disabled in premium-only mode
-        if data.get("type") != "market_data":
-            return
-        sym = data.get("symbol", "")
-        spot = float(data.get("data", {}).get("ltp", 0) or 0)
-        if not spot:
-            return
-        self.spot_ltp_map[sym] = spot
-
-        for ul, pos in list(self.positions.items()):
-            if pos.get("spot_symbol") != sym:
-                continue
-            opt_sym = pos["symbol"]
-            with self.exit_lock:
-                if opt_sym in self.exit_queue:
-                    continue
-
-                direction   = pos["option_type"]          # "CE" or "PE"
-                spot_entry  = pos["spot_entry"]
-                reward_dist = pos["reward_dist"]          # full reward distance (points)
-                activate_at = reward_dist * (TRAIL_ACTIVATE_AT_PCT / 100.0)
-                trail_width = reward_dist * (TRAIL_STEP_RR_PCT / 100.0)
-
-                if direction == "CE":
-                    move = spot - spot_entry              # positive = favourable
-                    if move >= activate_at:
-                        # Activate / update trail
-                        if not pos["trail_active"]:
-                            pos["trail_active"] = True
-                            pos["trail_peak"]   = spot
-                            pos["trail_sl_spot"]= spot - trail_width
-                            print(f"[TRAIL] {ul} CE — trailing SL activated | "
-                                  f"peak={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
-                        else:
-                            if spot > pos["trail_peak"]:
+                    if direction == "CE":
+                        move = spot - spot_entry
+                        if move >= activate_at:
+                            if not pos["trail_active"]:
+                                pos["trail_active"] = True
+                                pos["trail_peak"]   = spot
+                                pos["trail_sl_spot"]= spot - trail_width
+                                print(f"[TRAIL-S] {ul} CE — activated | peak={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
+                            elif spot > pos["trail_peak"]:
                                 pos["trail_peak"]    = spot
                                 pos["trail_sl_spot"] = spot - trail_width
-                                print(f"[TRAIL] {ul} CE — trail raised | "
-                                      f"peak={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
-
-                        # Check if spot has fallen below trailing SL
-                        if spot <= pos["trail_sl_spot"]:
-                            reason = (
-                                f"SPOT TRAILING SL HIT "
-                                f"(spot {spot:.1f} ≤ trail_sl {pos['trail_sl_spot']:.1f})"
-                            )
-                            self.exit_queue.add(opt_sym)
-                            print(f"\n[ALERT] {ul} CE: {reason}")
-                            t = threading.Thread(
-                                target=self._place_exit, args=(ul, reason), daemon=True
-                            )
-                            t.start()
-
-                else:  # PE — favourable move is spot falling
-                    move = spot_entry - spot             # positive = favourable
-                    if move >= activate_at:
-                        if not pos["trail_active"]:
-                            pos["trail_active"]  = True
-                            pos["trail_peak"]    = spot   # "peak" = lowest point for PE
-                            pos["trail_sl_spot"] = spot + trail_width
-                            print(f"[TRAIL] {ul} PE — trailing SL activated | "
-                                  f"trough={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
-                        else:
-                            if spot < pos["trail_peak"]:
+                                print(f"[TRAIL-S] {ul} CE — raised | peak={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
+                            
+                            if spot <= pos["trail_sl_spot"]:
+                                reason = f"SPOT TRAILING SL HIT (spot {spot:.1f} ≤ trail_sl {pos['trail_sl_spot']:.1f})"
+                    else: # PE
+                        move = spot_entry - spot
+                        if move >= activate_at:
+                            if not pos["trail_active"]:
+                                pos["trail_active"] = True
+                                pos["trail_peak"]   = spot
+                                pos["trail_sl_spot"] = spot + trail_width
+                                print(f"[TRAIL-S] {ul} PE — activated | trough={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
+                            elif spot < pos["trail_peak"]:
                                 pos["trail_peak"]    = spot
                                 pos["trail_sl_spot"] = spot + trail_width
-                                print(f"[TRAIL] {ul} PE — trail lowered | "
-                                      f"trough={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
+                                print(f"[TRAIL-S] {ul} PE — lowered | trough={spot:.1f} | sl_spot={pos['trail_sl_spot']:.1f}")
 
-                        if spot >= pos["trail_sl_spot"]:
-                            reason = (
-                                f"SPOT TRAILING SL HIT "
-                                f"(spot {spot:.1f} ≥ trail_sl {pos['trail_sl_spot']:.1f})"
-                            )
-                            self.exit_queue.add(opt_sym)
-                            print(f"\n[ALERT] {ul} PE: {reason}")
-                            t = threading.Thread(
-                                target=self._place_exit, args=(ul, reason), daemon=True
-                            )
-                            t.start()
+                            if spot >= pos["trail_sl_spot"]:
+                                reason = f"SPOT TRAILING SL HIT (spot {spot:.1f} ≥ trail_sl {pos['trail_sl_spot']:.1f})"
+
+                    if reason:
+                        self.exit_queue.add(opt_sym)
+                        print(f"\n[ALERT] {ul} {direction}: {reason}")
+                        threading.Thread(target=self._place_exit, args=(ul, reason), daemon=True).start()
 
     def _ws_thread(self):
         try:
@@ -1292,22 +1220,22 @@ class OptionsMomentumBot:
                 pass
 
     def _subscribe(self, exchange: str, symbol: str):
-        """Subscribe to option LTP feed (premium-based SL/target)."""
+        """Subscribe to option LTP feed."""
         try:
             self.client.subscribe_ltp(
                 [{"exchange": exchange, "symbol": symbol}],
-                on_data_received=self._on_ltp,
+                on_data_received=self._on_ws_data,
             )
             print(f"[WS] Subscribed option {symbol}")
         except Exception as exc:
             print(f"[WS] Subscribe error: {exc}")
 
     def _subscribe_spot(self, symbol: str):
-        """Subscribe to underlying spot LTP feed (trailing SL)."""
+        """Subscribe to underlying spot LTP feed."""
         try:
             self.client.subscribe_ltp(
                 [{"exchange": SPOT_EXCHANGE, "symbol": symbol}],
-                on_data_received=self._on_spot_ltp,
+                on_data_received=self._on_ws_data,
             )
             print(f"[WS] Subscribed spot {symbol}")
         except Exception as exc:
@@ -2451,11 +2379,17 @@ class OptionsMomentumBot:
             if atm_ce_ltp is not None and atm_pe_ltp is not None
             else None
         )
-        # Previous straddle price from the cache updated in the last scan cycle.
-        # This replaces the inaccurate 1%-proxy placeholder used previously.
-        prev_straddle_price = self._prev_straddle.get(symbol)
+        
+        # Institutional Straddle Velocity Audit:
+        # Only compare premium expansion if we are looking at the SAME strike as the previous minute.
+        # If the ATM strike shifted, velocity is undefined/reset for this bar.
+        prev_data = self._prev_straddle.get(symbol, {})
+        prev_straddle_price = None
+        if isinstance(prev_data, dict) and prev_data.get("strike") == atm:
+            prev_straddle_price = prev_data.get("price")
+            
         if straddle_price is not None:
-            self._prev_straddle[symbol] = straddle_price
+            self._prev_straddle[symbol] = {"strike": atm, "price": straddle_price}
 
         # Synthetic future price via client.syntheticfuture() for index underlyings;
         # falls back to a near-month futures quote for equity underlyings.
@@ -2680,7 +2614,13 @@ class OptionsMomentumBot:
                     self._check_broker_order_fills()
             except Exception as exc:
                 print(f"[STRATEGY ERROR] {exc}")
-            time.sleep(SIGNAL_CHECK_INTERVAL)
+
+            # Clock-anchored sync: sleep until the start of the next minute
+            # instead of a fixed 60s sleep. This ensures bar alignment.
+            now = time.time()
+            sleep_secs = 60 - (now % 60)
+            if sleep_secs < 1: sleep_secs += 60
+            time.sleep(sleep_secs)
 
     # ── Run ──────────────────────────────────────────────────────────────────
 

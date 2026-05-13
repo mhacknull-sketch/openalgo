@@ -33,14 +33,14 @@ Run via OpenAlgo's /python strategy runner:
 
 ⚠ RISK WARNING
     Long options buying has asymmetric payoff but unlimited theta decay.
-    Always set PREMIUM_STOP_PCT and ensure adequate capital. This script
+    Always set PREMIUM_STOP_PTS and ensure adequate capital. This script
     is for educational purposes; backtest before live use.
 
 KEY ENVIRONMENT VARIABLES
     LONG_ONLY_MODE=true        — options buyer mode: Buy CE on bullish signals,
                                  Buy PE on bearish signals.  No short-selling of
                                  options in either direction (default: true).
-    BROKER_SL_ORDERS=true      — place exchange-level SELL SL-M at the SL price
+    BROKER_SL_ORDERS=true      — place exchange-level SELL SL-M at the ssSL price
                                  and SELL LIMIT at the target price immediately
                                  after each BUY fill (default: true).  The trailing
                                  SL engine modifies the broker SL-M trigger as the
@@ -105,9 +105,9 @@ LOT_MULTIPLIER= int(os.getenv("LOT_MULTIPLIER","1"))    # lots to buy
 MIN_SCORE      = int(os.getenv("MIN_SCORE",    "15"))    # minimum |score| to trade
 MAX_TRAP       = int(os.getenv("MAX_TRAP",     "80"))    # maximum trap score to trade
 
-# Risk Management — Premium SL / Target
-PREMIUM_STOP_PCT   = float(os.getenv("PREMIUM_STOP_PCT",    "30.0"))   # % loss from entry premium
-PREMIUM_TARGET_PCT = float(os.getenv("PREMIUM_TARGET_PCT",  "80.0"))   # % gain from entry premium
+# Risk Management — Premium SL / Target (fixed ₹ points, not percentage)
+PREMIUM_STOP_PTS   = float(os.getenv("PREMIUM_STOP_PTS",    "30.0"))   # fixed ₹ loss from entry premium
+PREMIUM_TARGET_PTS = float(os.getenv("PREMIUM_TARGET_PTS",  "50.0"))   # fixed ₹ gain from entry premium
 
 # Session-level risk gates (set to 0 to disable each gate)
 MAX_TRADES_PER_SESSION    = int(os.getenv("MAX_TRADES_PER_SESSION",   "5"))   # 0 = unlimited
@@ -119,7 +119,7 @@ RISK_PERCENT              = float(os.getenv("RISK_PERCENT",        "1.0"))    # 
 
 # Trailing SL mode: "spot" (spot-point distance), "premium" (option LTP),
 # or "both" (run both; first to trigger exits). Percentages apply to the
-# reward distance (entry_premium × PREMIUM_TARGET_PCT / 100) in premium mode.
+# reward distance = PREMIUM_TARGET_PTS (fixed ₹ points) in premium mode.
 TRAIL_SL_MODE          = os.getenv("TRAIL_SL_MODE",            "premium")   # "spot" | "premium" | "both"
 SPOT_REWARD_PCT        = float(os.getenv("SPOT_REWARD_PCT",        "1.0"))  # % spot move = full reward target
 TRAIL_ACTIVATE_AT_PCT  = float(os.getenv("TRAIL_ACTIVATE_AT_PCT",  "25.0")) # activate after 25 % of reward
@@ -146,7 +146,7 @@ SIGNAL_CHECK_INTERVAL = int(os.getenv("SIGNAL_CHECK_INTERVAL", "60"))  # seconds
 # L2 OI/Vol/Premium SMA smoothing: 1 = no smoothing (default); N >= 2 = SMA of
 # last N chain snapshots per strike (recommended 3–5, larger = more lag).
 # ⚠ Not applied to ATM straddle velocity or delta imbalance (ATM strike can shift).
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "3"))
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "5"))
 
 # ── check_all_checkpoints / best-strike selection ────────────────────────────
 # Maximum IVR (IV Rank %) allowed for entry — buyer structural edge degrades
@@ -191,10 +191,10 @@ def _validate_config():
     """
     errors: list[str] = []
 
-    if not (0 < PREMIUM_STOP_PCT < 100):
-        errors.append(f"PREMIUM_STOP_PCT={PREMIUM_STOP_PCT} must be in range (0, 100)")
-    if PREMIUM_TARGET_PCT <= 0:
-        errors.append(f"PREMIUM_TARGET_PCT={PREMIUM_TARGET_PCT} must be > 0")
+    if PREMIUM_STOP_PTS <= 0:
+        errors.append(f"PREMIUM_STOP_PTS={PREMIUM_STOP_PTS} must be > 0 (fixed ₹ points)")
+    if PREMIUM_TARGET_PTS <= 0:
+        errors.append(f"PREMIUM_TARGET_PTS={PREMIUM_TARGET_PTS} must be > 0 (fixed ₹ points)")
     if RISK_PERCENT <= 0:
         errors.append(f"RISK_PERCENT={RISK_PERCENT} must be > 0")
     if TRAIL_SL_MODE not in ("spot", "premium", "both"):
@@ -955,7 +955,7 @@ class OptionsMomentumBot:
         print(f"[BOT] Underlyings: {', '.join(UNDERLYINGS)}")
         print(f"[BOT] DTE range: {DTE_MIN}–{DTE_MAX} days | OTM offset: {OTM_OFFSET}")
         print(f"[BOT] Score threshold: {MIN_SCORE} | Max trap: {MAX_TRAP}")
-        print(f"[BOT] Premium SL: {PREMIUM_STOP_PCT}% | Target: {PREMIUM_TARGET_PCT}%")
+        print(f"[BOT] Premium SL: ₹{PREMIUM_STOP_PTS} pts | Target: ₹{PREMIUM_TARGET_PTS} pts")
         print(f"[BOT] Risk gates — max trades/session: {MAX_TRADES_PER_SESSION} | "
               f"max loss streak: {MAX_CONSECUTIVE_LOSSES} | cooldown: {ENTRY_COOLDOWN_SECS}s")
         print(f"[BOT] Daily loss limit — {MAX_DAILY_LOSS_PCT}% of live available cash | ₹{MAX_DAILY_LOSS_AMOUNT:.0f} absolute")
@@ -1146,7 +1146,7 @@ class OptionsMomentumBot:
                     elif ltp >= tgt:
                         reason = f"TARGET HIT (LTP {ltp:.2f} ≥ TGT {tgt:.2f})"
                     elif TRAIL_SL_MODE in ("premium", "both"):
-                        reward      = entry * (PREMIUM_TARGET_PCT / 100.0)
+                        reward      = PREMIUM_TARGET_PTS
                         activate_at = reward * (TRAIL_ACTIVATE_AT_PCT / 100.0)
                         trail_width = reward * (TRAIL_STEP_RR_PCT    / 100.0)
                         move        = ltp - entry
@@ -1945,8 +1945,8 @@ class OptionsMomentumBot:
         executed: float,
     ) -> bool:
         """Record a confirmed BUY fill and place broker-side protection."""
-        sl = round(executed * (1 - PREMIUM_STOP_PCT / 100), 2)
-        tgt = round(executed * (1 + PREMIUM_TARGET_PCT / 100), 2)
+        sl = round(executed - PREMIUM_STOP_PTS, 2)
+        tgt = round(executed + PREMIUM_TARGET_PTS, 2)
         reward_dist = spot * SPOT_REWARD_PCT / 100.0
 
         with self.state_lock:
@@ -2055,8 +2055,8 @@ class OptionsMomentumBot:
             print(f"        Spot entry {spot:.1f} | reward dist {reward_dist:.1f} pts | "
                   f"spot trail activates at +{reward_dist * TRAIL_ACTIVATE_AT_PCT / 100:.1f} pts")
         if TRAIL_SL_MODE in ("premium", "both"):
-            prem_reward = executed * (PREMIUM_TARGET_PCT / 100.0)
-            print(f"        Premium entry ₹{executed:.2f} | prem reward ₹{prem_reward:.2f} | "
+            prem_reward = PREMIUM_TARGET_PTS
+            print(f"        Premium entry ₹{executed:.2f} | prem reward ₹{prem_reward:.2f} pts (fixed) | "
                   f"trail activates at +₹{prem_reward * TRAIL_ACTIVATE_AT_PCT / 100:.2f}")
 
         self._send_telegram(
@@ -2334,6 +2334,10 @@ class OptionsMomentumBot:
             print(f"[SCAN] {symbol}: no spot LTP, skipping")
             return
 
+        _candle_info = (f"{len(df_spot)} candles | latest_close={df_spot['close'].iloc[-1]:.2f}"
+                        if df_spot is not None and len(df_spot) > 0 else "no candles")
+        print(f"[DATA] {symbol}: spot={spot:.2f} | {_candle_info}")
+
         # Select the target expiry within the DTE_MIN–DTE_MAX window.
         # This ensures we never enter a weekly expiry or a contract outside the
         # intended DTE range.  `_fetch_target_expiry` handles the DTE filter.
@@ -2346,6 +2350,8 @@ class OptionsMomentumBot:
         if not chain_rows:
             print(f"[SCAN] {symbol}: empty option chain, skipping")
             return
+
+        print(f"[DATA] {symbol}: chain={len(chain_rows)} strikes | expiry={chain_expiry or target_expiry}")
 
         # SMA-smooth chain OI/Vol/Premium over LOOKBACK_BARS bars for L2 signals.
         # Raw chain_rows kept for ATM extraction, straddle velocity, and delta.
@@ -2376,6 +2382,10 @@ class OptionsMomentumBot:
                     pe_ask = row.get("pe_ask")
                     break
 
+        print(f"[DATA] {symbol}: ATM={atm}"
+              f" | CE ltp={atm_ce_ltp} (bid={ce_bid}/ask={ce_ask})"
+              f" | PE ltp={atm_pe_ltp} (bid={pe_bid}/ask={pe_ask})")
+
         # Straddle price (ATM CE + ATM PE)
         straddle_price = (
             (atm_ce_ltp + atm_pe_ltp)
@@ -2394,10 +2404,20 @@ class OptionsMomentumBot:
         if straddle_price is not None:
             self._prev_straddle[symbol] = {"strike": atm, "price": straddle_price}
 
+        _straddle_str  = f"{straddle_price:.2f}" if straddle_price is not None else "N/A"
+        _prev_str      = f"{prev_straddle_price:.2f}" if prev_straddle_price is not None else "N/A (first bar or ATM shifted)"
+        print(f"[DATA] {symbol}: straddle={_straddle_str} | prev_straddle={_prev_str}")
+
         # Synthetic future price via client.syntheticfuture() for index underlyings;
         # falls back to a near-month futures quote for equity underlyings.
         # Pass the selected expiry so the SF price matches the chain expiry.
         sf_ltp = self._fetch_synthetic_future(symbol, expiry_used)
+
+        _sf_str    = f"{sf_ltp:.2f}" if sf_ltp else "N/A"
+        _basis_str = f"{sf_ltp - spot:+.1f}" if sf_ltp else "N/A"
+        _ps_str    = f"{self._prev_spot.get(symbol):.2f}" if self._prev_spot.get(symbol) else "N/A"
+        _psf_str   = f"{self._prev_sf.get(symbol):.2f}" if self._prev_sf.get(symbol) else "N/A"
+        print(f"[DATA] {symbol}: SF={_sf_str} | basis={_basis_str} | prev_spot={_ps_str} | prev_SF={_psf_str}")
 
         # Previous scan's spot and SF prices for co-movement scoring (component 13).
         # These are updated AFTER scoring so consecutive scans compare correctly.
@@ -2410,6 +2430,12 @@ class OptionsMomentumBot:
 
         # IV Rank — derived from the already-fetched spot_q (no extra API call).
         iv_rank = self._fetch_iv_rank(spot_q)
+
+        _di_sum = (f"{ce_delta + pe_delta:+.3f}" if ce_delta is not None and pe_delta is not None
+                   else "N/A (no Greeks — LTP fallback)")
+        _ivr_str = f"{iv_rank:.1f}%" if iv_rank is not None else "N/A"
+        print(f"[DATA] {symbol}: CE_delta={ce_delta} | PE_delta={pe_delta} | Δ_sum={_di_sum} | IVR={_ivr_str}")
+
         if iv_rank is not None and iv_rank >= IV_RANK_MAX_ENTRY:
             print(f"[SKIP] {symbol}: IVR {iv_rank:.1f}% >= max {IV_RANK_MAX_ENTRY:.1f}%")
             return
@@ -2447,8 +2473,11 @@ class OptionsMomentumBot:
         direction  = result["direction"]
 
         print(f"[SCORE] {symbol}: {score:+d} ({label}) | trap={trap_score} | signal={signal}")
-        for note in result["reasons"][:4]:
-            print(f"        • {note}")
+        for c in result["components"]:
+            _bar = "▓" * int(abs(c["score"]) / c["max"] * 4) if c["max"] > 0 else ""
+            print(f"  [{c['score']:+.1f}/{c['max']}] {_bar:<4} {c['label']:<22} {c['note']}")
+        if result["trap_reasons"]:
+            print(f"  [TRAP] " + " | ".join(result["trap_reasons"]))
 
         if signal != "EXECUTE":
             print(f"[SKIP] {symbol}: signal={signal}, not executing")
@@ -2502,14 +2531,14 @@ class OptionsMomentumBot:
         fixed_qty = LOT_MULTIPLIER * lotsize
         available_capital = self._available_capital()
         risk_cap = available_capital * (RISK_PERCENT / 100.0)
-        risk_per_unit = option_ltp * (PREMIUM_STOP_PCT / 100.0)
+        risk_per_unit = PREMIUM_STOP_PTS
         risk_qty = int(risk_cap / risk_per_unit) if risk_per_unit > 0 else 0
         risk_qty = (risk_qty // lotsize) * lotsize if lotsize > 0 else risk_qty
         qty = min(fixed_qty, risk_qty) if risk_qty > 0 else 0
         if qty <= 0:
             print(
                 f"[SKIP] {symbol}: 1 lot risk exceeds cap "
-                f"(premium ₹{option_ltp:.2f}, stop {PREMIUM_STOP_PCT}%, "
+                f"(premium ₹{option_ltp:.2f}, stop ₹{PREMIUM_STOP_PTS} pts, "
                 f"risk cap ₹{risk_cap:.0f})"
             )
             return
@@ -2641,7 +2670,7 @@ class OptionsMomentumBot:
         print(f" Spot exch   : {SPOT_EXCHANGE}  |  F&O exch: {FNO_EXCHANGE}")
         print(f" DTE         : {DTE_MIN}–{DTE_MAX} days  |  OTM offset: {OTM_OFFSET}")
         print(f" Score gate  : ≥{MIN_SCORE}  |  Trap gate: ≤{MAX_TRAP}")
-        print(f" Premium SL  : {PREMIUM_STOP_PCT}%  |  Target: {PREMIUM_TARGET_PCT}%")
+        print(f" Premium SL  : ₹{PREMIUM_STOP_PTS:.1f} pts  |  Target: ₹{PREMIUM_TARGET_PTS:.1f} pts")
         print(f" Candle      : {CANDLE_INTERVAL}  |  Lookback: {LOOKBACK_DAYS}d")
         print(f" Loop        : every {SIGNAL_CHECK_INTERVAL}s")
         print("─" * 70)
@@ -2654,13 +2683,13 @@ class OptionsMomentumBot:
         if TRAIL_SL_MODE in ("spot", "both"):
             print(f"  [Spot]    Reward target  : {SPOT_REWARD_PCT}% spot move")
         if TRAIL_SL_MODE in ("premium", "both"):
-            print(f"  [Premium] Reward target  : {PREMIUM_TARGET_PCT}% of entry premium")
+            print(f"  [Premium] Reward target  : ₹{PREMIUM_TARGET_PTS:.1f} pts (fixed)")
         print(f"  Activates after    : {TRAIL_ACTIVATE_AT_PCT}% of reward")
         print(f"  Trail step         : {TRAIL_STEP_RR_PCT}% of reward distance")
         print(f" [ORDER PROTECTION]")
         print(f"  Long-only mode     : {'ENABLED — CE (calls) only' if LONG_ONLY_MODE else 'disabled (CE + PE)'}")
         if BROKER_SL_ORDERS:
-            print(f"  Broker SL orders   : ENABLED — SL-M @ -{PREMIUM_STOP_PCT}% + LIMIT @ +{PREMIUM_TARGET_PCT}%")
+            print(f"  Broker SL orders   : ENABLED — SL-M @ -₹{PREMIUM_STOP_PTS:.1f} pts + LIMIT @ +₹{PREMIUM_TARGET_PTS:.1f} pts")
             print(f"                       Trailing SL modifies broker SL-M trigger as trail ratchets")
         else:
             print(f"  Broker SL orders   : disabled (software WebSocket monitoring only)")
